@@ -907,7 +907,3 @@ python -m pytest tests/ -q  # Make sure tests pass
 ```
 
 ---
-
-## 📜 License
-
-MIT
