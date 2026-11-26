@@ -441,6 +441,17 @@ def run_generation(report_name=None, output_dir=None, calendar_start=None,
         # project so the two can be read together during review.
         _write_extraction_report(report_name, project_dir, base_dir)
 
+        # No project on disk is a failed migration, whatever the steps above
+        # reported. Saying otherwise sends the user to open a .pbip that was
+        # never written.
+        if not _lp_isdir(project_dir):
+            logger.error("Generation produced no project at %s", project_dir)
+            print(f"\n✗ No Power BI project was produced at {project_dir}")
+            print("  The workbook yielded nothing to migrate — it may hold only")
+            print("  connection metadata, with no worksheets or dashboards.")
+            print("  See EXTRACTION_REPORT.md for what was found in the source.")
+            return False
+
         print("\n✓ Power BI project generated successfully")
         return True
 
@@ -3760,8 +3771,13 @@ def _print_migration_summary(results, report_summary, start_time):
         approx = report_summary.get('approximate', 0)
         unsup = report_summary.get('unsupported', 0)
         print(f"\n  Migration Fidelity:")
-        print(f"    {'Fidelity Score':<30} {fidelity}%")
-        print(f"    {'Exact Conversions':<30} {exact}/{total}")
+        if not total:
+            # 100% of nothing is not a result. Say so rather than printing a
+            # perfect score for a workbook that converted no items.
+            print(f"    {'Fidelity Score':<30} n/a — no items to convert")
+        else:
+            print(f"    {'Fidelity Score':<30} {fidelity}%")
+            print(f"    {'Exact Conversions':<30} {exact}/{total}")
         if approx:
             print(f"    {'Approximate':<30} {approx}")
         if unsup:
