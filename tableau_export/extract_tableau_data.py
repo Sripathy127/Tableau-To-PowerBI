@@ -247,8 +247,25 @@ class TableauExtractor:
         self._xml_node_cache = {}
 
     def _findall_root_cached(self, root, xpath):
-        """Return cached ``safe_findall`` results for repeated root-level queries."""
-        root_cache = self._xml_node_cache.setdefault(id(root), {})
+        """Return cached ``safe_findall`` results for repeated root-level queries.
+
+        The cache is created on first use rather than only in ``__init__``, so
+        instances built with ``TableauExtractor.__new__`` still work. Tests use
+        that form to skip the directory creation ``__init__`` performs, and so
+        do embedders that want no filesystem side effects.
+        """
+        cache = getattr(self, '_xml_node_cache', None)
+        if cache is None:
+            cache = {}
+            self._xml_node_cache = cache
+        # Keep a reference to *root* beside its entry. Keying on id() alone
+        # would let a freed element's id be reused by an unrelated tree and
+        # serve its cached nodes to the wrong workbook.
+        entry = cache.get(id(root))
+        if entry is None or entry[0] is not root:
+            entry = (root, {})
+            cache[id(root)] = entry
+        root_cache = entry[1]
         if xpath not in root_cache:
             root_cache[xpath] = safe_findall(root, xpath)
         return root_cache[xpath]

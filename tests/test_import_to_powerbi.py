@@ -168,16 +168,37 @@ class TestGeneratePowerBIProject(unittest.TestCase):
         # On Windows, os.path.abspath('/custom/out') adds drive letter
         self.assertIn('custom', str(call_kwargs).lower())
 
-    def test_exception_handled_gracefully(self):
+    def test_generation_failure_propagates(self):
+        """A failed generation must not be swallowed.
+
+        It used to print a warning and return, after which the pipeline
+        printed its success banner — so a project that was never written
+        looked migrated. The failure now reaches the caller, which turns it
+        into a failed step.
+        """
         imp = PowerBIImporter()
         converted = {'datasources': [{'name': 'ds'}]}
         with patch('import_to_powerbi.PowerBIProjectGenerator') as MockGen:
             MockGen.side_effect = Exception('test error')
             with patch('builtins.print') as mock_print:
-                imp.generate_powerbi_project('Report', converted)
+                with self.assertRaises(Exception) as ctx:
+                    imp.generate_powerbi_project('Report', converted)
+            self.assertIn('test error', str(ctx.exception))
             calls = [str(c) for c in mock_print.call_args_list]
-            warn_found = any('WARN' in c for c in calls)
-            self.assertTrue(warn_found)
+            self.assertTrue(any('ERROR' in c for c in calls),
+                            'the failure should be reported as an error')
+            self.assertFalse(any('WARN' in c for c in calls),
+                             'a failed generation is not a warning')
+
+    def test_generation_failure_is_recorded(self):
+        imp = PowerBIImporter()
+        converted = {'datasources': [{'name': 'ds'}]}
+        with patch('import_to_powerbi.PowerBIProjectGenerator') as MockGen:
+            MockGen.side_effect = Exception('boom')
+            with patch('builtins.print'):
+                with self.assertRaises(Exception):
+                    imp.generate_powerbi_project('Report', converted)
+        self.assertIsNotNone(getattr(imp, 'generation_error', None))
 
     def test_passes_calendar_params(self):
         imp = PowerBIImporter()

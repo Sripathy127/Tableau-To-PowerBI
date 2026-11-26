@@ -1,0 +1,104 @@
+# Migrate a Tableau workbook to Power BI on a hosted Windows runner.
+#
+# Power BI Desktop and pbi-tools are Windows-only, so macOS and Linux users
+# cannot produce a .pbix locally. This workflow does the whole migration on a
+# free windows-latest runner and publishes the result as a downloadable
+# artifact: the .pbip project, the extraction report, and a .pbix when
+# pbi-tools manages to compile one.
+#
+# Run it from the Actions tab -> "Migrate Tableau Workbook" -> Run workflow.
+
+name: Migrate Tableau Workbook
+
+on:
+  workflow_dispatch:
+    inputs:
+      workbook:
+        description: 'Path to the .twb/.twbx in this repo (e.g. samples/sales.twbx)'
+        required: true
+      build_pbix:
+        description: 'Also compile a .pbix with pbi-tools'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    runs-on: windows-latest
+
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+      # Keep the output path short: PBIR nests deeply and Power BI Desktop
+      # itself refuses projects near MAX_PATH.
+      OUT_DIR: D:\pbi
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Confirm the workbook exists
+        shell: pwsh
+        run: |
+          $wb = "${{ inputs.workbook }}"
+          if (-not (Test-Path $wb)) {
+            Write-Error "Workbook not found: $wb"
+            exit 1
+          }
+          Write-Host "Migrating $wb"
+
+      - name: Migrate to a Power BI project
+        shell: pwsh
+        run: |
+          chcp 65001 > $null
+          New-Item -ItemType Directory -Force $env:OUT_DIR | Out-Null
+          # Core migration is standard library only - nothing to install.
+          python migrate.py migrate "${{ inputs.workbook }}" --output-dir $env:OUT_DIR
+
+      - name: Compile to .pbix with pbi-tools
+        if: ${{ inputs.build_pbix }}
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $url = 'https://github.com/pbi-tools/pbi-tools/releases/download/1.0.1/pbi-tools.1.0.1.zip'
+          Invoke-WebRequest -Uri $url -OutFile pbi-tools.zip
+          Expand-Archive -Path pbi-tools.zip -DestinationPath pbi-tools -Force
+
+          Get-ChildItem $env:OUT_DIR -Filter *.pbip -Recurse | ForEach-Object {
+            $pbix = Join-Path $_.DirectoryName ($_.BaseName + '.pbix')
+            Write-Host "Compiling $($_.FullName) -> $pbix"
+            .\pbi-tools\pbi-tools.exe compile $_.FullName -outPath $pbix
+          }
+
+      - name: Package the project
+        shell: pwsh
+        run: |
+          $stage = 'artifact-out'
+          New-Item -ItemType Directory -Force $stage | Out-Null
+
+          Get-ChildItem $env:OUT_DIR -Directory | ForEach-Object {
+            Compress-Archive -Path $_.FullName `
+              -DestinationPath (Join-Path $stage ($_.Name + '-pbip.zip')) -Force
+          }
+          Get-ChildItem $env:OUT_DIR -Include *.pbix,*.md,*.html,*.json `
+            -Recurse -File | Copy-Item -Destination $stage -Force
+
+          Write-Host ''
+          Write-Host 'Packaged for download:'
+          Get-ChildItem $stage | Format-Table Name, Length -AutoSize
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: powerbi-migration
+          path: artifact-out/**
+          retention-days: 30
+          if-no-files-found: error

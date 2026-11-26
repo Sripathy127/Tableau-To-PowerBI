@@ -206,7 +206,16 @@ class PowerBIImporter:
             print(f"  [OK] Power BI Project created: {project_path}")
             
         except Exception as e:
-            print(f"  [WARN] Error generating Power BI Project: {str(e)}")
+            # A generation failure must not be reported as a warning and then
+            # followed by a success banner — that is how a broken project
+            # reaches the user looking migrated. Record it, log the traceback
+            # for diagnosis, and let import_all turn it into a failed step.
+            import traceback
+            self.generation_error = e
+            print(f"  [ERROR] Power BI Project generation failed: {e}")
+            logger.error("Power BI Project generation failed: %s", e)
+            logger.debug("Generation traceback:\n%s", traceback.format_exc())
+            raise
 
     def import_shared_model(self, model_name, all_converted_objects,
                             workbook_names, output_dir=None,

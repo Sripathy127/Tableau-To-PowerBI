@@ -26,6 +26,23 @@ import re
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Tuple
 
+# Windows MAX_PATH guard: the generated PBIR tree can exceed 260 chars,
+# where plain open/listdir raise 'not found' and glob silently matches
+# nothing. No-op off Windows and on short paths.
+try:
+    from longpath import (
+        lp_open as _lp_open, listdir as _lp_listdir, walk as _lp_walk,
+        isfile as _lp_isfile, isdir as _lp_isdir, exists as _lp_exists,
+        lp_glob as _lp_glob, makedirs as _lp_makedirs,
+    )
+except ImportError:  # pragma: no cover - import-style fallback
+    from powerbi_import.longpath import (
+        lp_open as _lp_open, listdir as _lp_listdir, walk as _lp_walk,
+        isfile as _lp_isfile, isdir as _lp_isdir, exists as _lp_exists,
+        lp_glob as _lp_glob, makedirs as _lp_makedirs,
+    )
+
+
 try:
     from powerbi_import.dax_validator import validate_dax_expression
 except Exception:  # noqa: BLE001
@@ -138,11 +155,11 @@ def extract_m_partitions(tmdl_text: str) -> List[Tuple[str, str]]:
 
 def _check_structure(project_dir) -> CheckResult:
     issues = []
-    has_sm = bool(glob.glob(os.path.join(project_dir, "**", "*.SemanticModel"),
+    has_sm = bool(_lp_glob(os.path.join(project_dir, "**", "*.SemanticModel"),
                             recursive=True)) or bool(_tmdl_files(project_dir))
-    has_report = bool(glob.glob(os.path.join(project_dir, "**", "definition.pbir"),
+    has_report = bool(_lp_glob(os.path.join(project_dir, "**", "definition.pbir"),
                                 recursive=True)) or bool(
-        glob.glob(os.path.join(project_dir, "**", "*.Report"), recursive=True))
+        _lp_glob(os.path.join(project_dir, "**", "*.Report"), recursive=True))
     if not has_sm:
         issues.append("no semantic model (.SemanticModel / .tmdl) found")
     if not has_report:
@@ -155,12 +172,12 @@ def _check_json_parse(project_dir) -> CheckResult:
     patterns = ["*.json", "*.pbir", "*.pbip", ".platform"]
     seen = set()
     for pat in patterns:
-        for fp in glob.glob(os.path.join(project_dir, "**", pat), recursive=True):
+        for fp in _lp_glob(os.path.join(project_dir, "**", pat), recursive=True):
             if fp in seen:
                 continue
             seen.add(fp)
             try:
-                with open(fp, "r", encoding="utf-8") as fh:
+                with _lp_open(fp, "r", encoding="utf-8") as fh:
                     json.load(fh)
             except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                 issues.append(f"{os.path.relpath(fp, project_dir)}: {exc}")
@@ -209,7 +226,7 @@ def _check_dax(project_dir) -> CheckResult:
 
 def _check_schema(project_dir) -> CheckResult:
     issues = []
-    for fp in glob.glob(os.path.join(project_dir, "**", "visual.json"), recursive=True):
+    for fp in _lp_glob(os.path.join(project_dir, "**", "visual.json"), recursive=True):
         data = _read_json(fp)
         if isinstance(data, dict) and "$schema" not in data:
             issues.append(f"{os.path.relpath(fp, project_dir)}: missing $schema")
@@ -219,7 +236,7 @@ def _check_schema(project_dir) -> CheckResult:
 def _check_references(project_dir) -> CheckResult:
     """Verify the report→semantic-model link resolves (a dangling link won't open)."""
     issues = []
-    for pbir in glob.glob(os.path.join(project_dir, "**", "definition.pbir"),
+    for pbir in _lp_glob(os.path.join(project_dir, "**", "definition.pbir"),
                           recursive=True):
         data = _read_json(pbir)
         if not isinstance(data, dict):
@@ -228,7 +245,7 @@ def _check_references(project_dir) -> CheckResult:
         by_path = (ref.get("byPath") or {}).get("path")
         if by_path:
             target = os.path.normpath(os.path.join(os.path.dirname(pbir), by_path))
-            if not os.path.isdir(target):
+            if not _lp_isdir(target):
                 issues.append(f"{os.path.relpath(pbir, project_dir)}: datasetReference "
                               f"byPath '{by_path}' does not resolve to a folder. "
                               f"Fix: point byPath to the generated *.SemanticModel folder.")
@@ -241,40 +258,40 @@ def _check_references(project_dir) -> CheckResult:
 def _check_report_structure(project_dir) -> CheckResult:
     """Verify essential report files/pages/visual files exist and are complete."""
     issues = []
-    report_dirs = glob.glob(os.path.join(project_dir, "**", "*.Report"), recursive=True)
+    report_dirs = _lp_glob(os.path.join(project_dir, "**", "*.Report"), recursive=True)
     for report_dir in report_dirs:
         pbir = os.path.join(report_dir, "definition.pbir")
         report_json_root = os.path.join(report_dir, "report.json")
         report_json_def = os.path.join(report_dir, "definition", "report.json")
-        if not os.path.isfile(pbir):
+        if not _lp_isfile(pbir):
             issues.append(
                 f"{os.path.relpath(report_dir, project_dir)}: missing definition.pbir. "
                 f"Fix: regenerate report metadata or restore definition.pbir."
             )
-        if not (os.path.isfile(report_json_root) or os.path.isfile(report_json_def)):
+        if not (_lp_isfile(report_json_root) or _lp_isfile(report_json_def)):
             issues.append(
                 f"{os.path.relpath(report_dir, project_dir)}: missing report.json. "
                 f"Fix: regenerate report shell so Desktop can load report metadata."
             )
 
         pages_root = os.path.join(report_dir, "definition", "pages")
-        page_dirs = [p for p in glob.glob(os.path.join(pages_root, "*")) if os.path.isdir(p)]
+        page_dirs = [p for p in _lp_glob(os.path.join(pages_root, "*")) if _lp_isdir(p)]
         if not page_dirs:
             # Some helper/thin reports may be intentionally empty; keep advisory only.
             continue
 
         for page_dir in page_dirs:
             page_json = os.path.join(page_dir, "page.json")
-            if not os.path.isfile(page_json):
+            if not _lp_isfile(page_json):
                 issues.append(
                     f"{os.path.relpath(page_dir, project_dir)}: missing page.json. "
                     f"Fix: recreate page metadata for this page folder."
                 )
             visuals_root = os.path.join(page_dir, "visuals")
-            visual_dirs = [v for v in glob.glob(os.path.join(visuals_root, "*")) if os.path.isdir(v)]
+            visual_dirs = [v for v in _lp_glob(os.path.join(visuals_root, "*")) if _lp_isdir(v)]
             for visual_dir in visual_dirs:
                 visual_json = os.path.join(visual_dir, "visual.json")
-                if not os.path.isfile(visual_json):
+                if not _lp_isfile(visual_json):
                     issues.append(
                         f"{os.path.relpath(visual_dir, project_dir)}: missing visual.json. "
                         f"Fix: recreate the visual container metadata."
@@ -286,7 +303,7 @@ def _check_report_structure(project_dir) -> CheckResult:
 def _check_tmdl_partitions(project_dir) -> CheckResult:
     """Validate table/partition integrity in TMDL files (common Desktop load breaker)."""
     issues = []
-    table_tmdls = glob.glob(
+    table_tmdls = _lp_glob(
         os.path.join(project_dir, "**", "definition", "tables", "*.tmdl"),
         recursive=True,
     )
@@ -350,7 +367,7 @@ def _check_tmdl_partitions(project_dir) -> CheckResult:
 def check_openability(project_dir: str) -> OpenabilityReport:
     """Run the full PBI Desktop openability preflight."""
     report = OpenabilityReport(project_dir=project_dir)
-    if not project_dir or not os.path.isdir(project_dir):
+    if not project_dir or not _lp_isdir(project_dir):
         report.checks.append(CheckResult("structure", False, "error",
                                          ["project dir not found"]))
         return report
@@ -373,17 +390,17 @@ def check_openability(project_dir: str) -> OpenabilityReport:
 # ════════════════════════════════════════════════════════════════════
 
 def _tmdl_files(project_dir):
-    return glob.glob(os.path.join(project_dir, "**", "*.tmdl"), recursive=True)
+    return _lp_glob(os.path.join(project_dir, "**", "*.tmdl"), recursive=True)
 
 
 def _read(path):
-    with open(path, "r", encoding="utf-8") as fh:
+    with _lp_open(path, "r", encoding="utf-8") as fh:
         return fh.read()
 
 
 def _read_json(path):
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        with _lp_open(path, "r", encoding="utf-8") as fh:
             return json.load(fh)
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return None

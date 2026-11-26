@@ -17,6 +17,23 @@ import re
 import logging
 from pathlib import Path
 
+# Windows MAX_PATH guard: the generated PBIR tree can exceed 260 chars,
+# where plain open/listdir raise 'not found' and glob silently matches
+# nothing. No-op off Windows and on short paths.
+try:
+    from longpath import (
+        lp_open as _lp_open, listdir as _lp_listdir, walk as _lp_walk,
+        isfile as _lp_isfile, isdir as _lp_isdir, exists as _lp_exists,
+        lp_glob as _lp_glob, makedirs as _lp_makedirs,
+    )
+except ImportError:  # pragma: no cover - import-style fallback
+    from powerbi_import.longpath import (
+        lp_open as _lp_open, listdir as _lp_listdir, walk as _lp_walk,
+        isfile as _lp_isfile, isdir as _lp_isdir, exists as _lp_exists,
+        lp_glob as _lp_glob, makedirs as _lp_makedirs,
+    )
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -175,7 +192,7 @@ class ArtifactValidator:
             if not artifact_path.exists():
                 return False, [f'File not found: {artifact_path}']
 
-            with open(artifact_path, 'r', encoding='utf-8') as f:
+            with _lp_open(artifact_path, 'r', encoding='utf-8') as f:
                 artifact = json.load(f)
 
             if not isinstance(artifact, dict):
@@ -211,7 +228,7 @@ class ArtifactValidator:
             Tuple of (is_valid, error_message_or_None)
         """
         try:
-            with open(filepath, 'r', encoding='utf-8') as f:
+            with _lp_open(filepath, 'r', encoding='utf-8') as f:
                 json.load(f)
             return True, None
         except json.JSONDecodeError as e:
@@ -231,7 +248,7 @@ class ArtifactValidator:
         """
         errors = []
         try:
-            with open(filepath, 'r', encoding='utf-8') as f:
+            with _lp_open(filepath, 'r', encoding='utf-8') as f:
                 content = f.read()
 
             if not content.strip():
@@ -359,7 +376,7 @@ class ArtifactValidator:
         """
         all_repairs = []
         try:
-            with open(filepath, 'r', encoding='utf-8') as f:
+            with _lp_open(filepath, 'r', encoding='utf-8') as f:
                 content = f.read()
         except OSError:
             return all_repairs
@@ -393,7 +410,7 @@ class ArtifactValidator:
                             modified = True
 
         if modified and not dry_run:
-            with open(filepath, 'w', encoding='utf-8') as f:
+            with _lp_open(filepath, 'w', encoding='utf-8') as f:
                 f.write('\n'.join(lines))
 
         return all_repairs
@@ -513,7 +530,7 @@ class ArtifactValidator:
         """
         issues = []
         try:
-            with open(filepath, 'r', encoding='utf-8') as f:
+            with _lp_open(filepath, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
         except OSError:
             return issues
@@ -691,7 +708,7 @@ class ArtifactValidator:
         def _scan_tmdl(filepath):
             """Read a single TMDL file and populate tables/columns/measures."""
             try:
-                with open(filepath, 'r', encoding='utf-8') as f:
+                with _lp_open(filepath, 'r', encoding='utf-8') as f:
                     lines = f.readlines()
             except OSError:
                 return
@@ -1370,7 +1387,7 @@ class ArtifactValidator:
                 else:
                     # PBIR structural validation on report.json
                     try:
-                        with open(report_json, 'r', encoding='utf-8') as f:
+                        with _lp_open(report_json, 'r', encoding='utf-8') as f:
                             rj = json.load(f)
                         schema_url = rj.get('$schema', '') if isinstance(rj, dict) else ''
                         if schema_url:
@@ -1408,7 +1425,7 @@ class ArtifactValidator:
                             else:
                                 # PBIR structural validation on page.json
                                 try:
-                                    with open(page_json, 'r', encoding='utf-8') as f:
+                                    with _lp_open(page_json, 'r', encoding='utf-8') as f:
                                         pj = json.load(f)
                                     schema_url = pj.get('$schema', '') if isinstance(pj, dict) else ''
                                     if schema_url:
@@ -1431,7 +1448,7 @@ class ArtifactValidator:
                                         else:
                                             # PBIR structural validation on visual.json
                                             try:
-                                                with open(visual_json, 'r', encoding='utf-8') as f:
+                                                with _lp_open(visual_json, 'r', encoding='utf-8') as f:
                                                     vj = json.load(f)
                                                 schema_url = vj.get('$schema', '') if isinstance(vj, dict) else ''
                                                 if schema_url:

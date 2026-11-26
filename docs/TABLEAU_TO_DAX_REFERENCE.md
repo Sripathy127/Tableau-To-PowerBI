@@ -223,7 +223,7 @@ When an aggregate wraps an expression (not a single column), the converter auto-
 | # | Tableau | DAX | Status | Notes |
 |---|---------|-----|--------|-------|
 | 1 | `{FIXED [dim] : AGG(expr)}` | `CALCULATE(AGG(expr), ALLEXCEPT('T', 'T'[dim]))` | ✅ | |
-| 2 | `{INCLUDE [dim] : AGG(expr)}` | `CALCULATE(AGG(expr))` | ✅ | |
+| 2 | `{INCLUDE [dim] : AGG(expr)}` | `AGGX(SUMMARIZE('T', 'T'[dim]), CALCULATE(AGG(expr)))` | ✅ | Iterator matches the inner aggregate: SUM→SUMX, AVERAGE→AVERAGEX, MIN→MINX, MAX→MAXX, counts→SUMX. Falls back to `CALCULATE(AGG(expr))` when a dimension is not a bare column or the aggregate is unrecognised. |
 | 3 | `{EXCLUDE [dim] : AGG(expr)}` | `CALCULATE(AGG(expr), REMOVEFILTERS('T'[dim]))` | ✅ | |
 | 4 | `{AGG(expr)}` (no dims) | `CALCULATE(AGG(expr))` | ✅ | |
 

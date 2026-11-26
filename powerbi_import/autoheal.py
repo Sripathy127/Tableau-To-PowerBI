@@ -41,6 +41,23 @@ from powerbi_import.m_healing import heal_m
 from powerbi_import.visual_healing import heal_visual
 from powerbi_import.openability import extract_m_partitions as _extract_m_partitions
 
+# Windows MAX_PATH guard: the generated PBIR tree can exceed 260 chars,
+# where plain open/listdir raise 'not found' and glob silently matches
+# nothing. No-op off Windows and on short paths.
+try:
+    from longpath import (
+        lp_open as _lp_open, listdir as _lp_listdir, walk as _lp_walk,
+        isfile as _lp_isfile, isdir as _lp_isdir, exists as _lp_exists,
+        lp_glob as _lp_glob, makedirs as _lp_makedirs,
+    )
+except ImportError:  # pragma: no cover - import-style fallback
+    from powerbi_import.longpath import (
+        lp_open as _lp_open, listdir as _lp_listdir, walk as _lp_walk,
+        isfile as _lp_isfile, isdir as _lp_isdir, exists as _lp_exists,
+        lp_glob as _lp_glob, makedirs as _lp_makedirs,
+    )
+
+
 # Validators (issue lists; empty == valid)
 try:
     from powerbi_import.dax_validator import validate_dax_expression
@@ -226,13 +243,13 @@ class PbiDesktopSource(ErrorSource):
             return True
         for base in (os.environ.get("ProgramFiles", ""),
                      os.environ.get("ProgramW6432", "")):
-            if base and os.path.exists(os.path.join(
+            if base and _lp_exists(os.path.join(
                     base, "Microsoft Power BI Desktop", "bin", "PBIDesktop.exe")):
                 return True
         return False
 
     def collect(self, project_dir: str) -> List[ErrorRecord]:
-        if self.log_path and os.path.isfile(self.log_path):
+        if self.log_path and _lp_isfile(self.log_path):
             return LogFileSource(self.log_path).collect(project_dir)
         return [ErrorRecord(
             "info", project_dir, "pbi_desktop",
@@ -258,7 +275,7 @@ class AutoHealer:
     # -- public ------------------------------------------------------
     def heal_project(self, project_dir: str) -> AutoHealReport:
         report = AutoHealReport(project_dir=project_dir)
-        if not project_dir or not os.path.isdir(project_dir):
+        if not project_dir or not _lp_isdir(project_dir):
             report.remaining_errors.append(
                 ErrorRecord("info", project_dir, "project", "project dir not found"))
             return report
@@ -268,6 +285,7 @@ class AutoHealer:
         for _ in range(self.max_iterations):
             report.iterations += 1
             changed = False
+            changed |= self._heal_report_shell(project_dir, report)
             changed |= self._heal_tmdl(project_dir, measure_names, report)
             changed |= self._heal_visuals(project_dir, report)
             residual = self.error_source.collect(project_dir)
@@ -289,6 +307,95 @@ class AutoHealer:
         return report
 
     # -- deterministic passes ---------------------------------------
+    def _heal_report_shell(self, project_dir, report) -> bool:
+        """Recreate missing PBIR report-shell files.
+
+        ``openability``'s ``report_structure`` check fails a project when
+        ``report.json``, ``pages.json``, ``page.json`` or ``version.json`` are
+        absent, and tells the user to "regenerate report shell". Those files
+        carry no workbook-specific content beyond page names, so rebuild them
+        here instead of only naming the problem. Existing files are never
+        touched — a shell that is present is assumed to be the real one.
+        """
+        from powerbi_import.pbip_generator import (
+            SCHEMA_REPORT, SCHEMA_PAGE, SCHEMA_PAGES_METADATA, SCHEMA_VERSION,
+        )
+
+        changed_any = False
+        report_dirs = _lp_glob(
+            os.path.join(project_dir, "**", "*.Report"), recursive=True)
+
+        for report_dir in report_dirs:
+            if not _lp_isdir(report_dir):
+                continue
+            definition = os.path.join(report_dir, "definition")
+            rel = lambda p: os.path.relpath(p, project_dir)
+
+            def _scaffold(path, data, artifact, note):
+                _lp_makedirs(os.path.dirname(path), exist_ok=True)
+                _write_json(path, data)
+                report.actions.append(RepairAttempt(
+                    file=rel(path), artifact=artifact, location="",
+                    before="<missing>", after=note,
+                    source="deterministic", confidence="high", validated=True,
+                ))
+
+            # report.json — either location satisfies the openability check.
+            if not (_lp_isfile(os.path.join(report_dir, "report.json"))
+                    or _lp_isfile(os.path.join(definition, "report.json"))):
+                _scaffold(
+                    os.path.join(definition, "report.json"),
+                    {"$schema": SCHEMA_REPORT, "settings": {}},
+                    "report", "regenerated report shell",
+                )
+                changed_any = True
+
+            # version.json
+            if _lp_isdir(definition) and not _lp_isfile(
+                    os.path.join(definition, "version.json")):
+                _scaffold(
+                    os.path.join(definition, "version.json"),
+                    {"$schema": SCHEMA_VERSION, "version": "2.0.0"},
+                    "version", "regenerated version metadata",
+                )
+                changed_any = True
+
+            pages_root = os.path.join(definition, "pages")
+            page_dirs = sorted(
+                p for p in _lp_glob(os.path.join(pages_root, "*"))
+                if _lp_isdir(p))
+            if not page_dirs:
+                continue
+
+            page_names = [os.path.basename(p) for p in page_dirs]
+
+            # pages.json — pageOrder is required by the schema validator.
+            if not _lp_isfile(os.path.join(pages_root, "pages.json")):
+                _scaffold(
+                    os.path.join(pages_root, "pages.json"),
+                    {"$schema": SCHEMA_PAGES_METADATA,
+                     "pageOrder": page_names,
+                     "activePageName": page_names[0]},
+                    "pages_metadata", "regenerated page index",
+                )
+                changed_any = True
+
+            # page.json — name and displayName are both required.
+            for page_dir, name in zip(page_dirs, page_names):
+                page_json = os.path.join(page_dir, "page.json")
+                if _lp_isfile(page_json):
+                    continue
+                _scaffold(
+                    page_json,
+                    {"$schema": SCHEMA_PAGE, "name": name,
+                     "displayName": name, "width": 1280, "height": 720,
+                     "displayOption": "FitToPage"},
+                    "page", "regenerated page metadata",
+                )
+                changed_any = True
+
+        return changed_any
+
     def _heal_tmdl(self, project_dir, measure_names, report) -> bool:
         changed_any = False
         for tmdl in _iter_tmdl(project_dir):
@@ -428,33 +535,33 @@ def heal_dax_expression(expr, measure_names=None, gateway=None, autofix=False):
 # ════════════════════════════════════════════════════════════════════
 
 def _iter_tmdl(project_dir):
-    yield from glob.glob(os.path.join(project_dir, "**", "*.tmdl"), recursive=True)
+    yield from _lp_glob(os.path.join(project_dir, "**", "*.tmdl"), recursive=True)
 
 
 def _iter_visuals(project_dir):
-    yield from glob.glob(os.path.join(project_dir, "**", "visual.json"), recursive=True)
+    yield from _lp_glob(os.path.join(project_dir, "**", "visual.json"), recursive=True)
 
 
 def _read(path):
-    with open(path, "r", encoding="utf-8") as fh:
+    with _lp_open(path, "r", encoding="utf-8") as fh:
         return fh.read()
 
 
 def _write(path, text):
-    with open(path, "w", encoding="utf-8") as fh:
+    with _lp_open(path, "w", encoding="utf-8") as fh:
         fh.write(text)
 
 
 def _read_json(path):
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        with _lp_open(path, "r", encoding="utf-8") as fh:
             return json.load(fh)
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return None
 
 
 def _write_json(path, data):
-    with open(path, "w", encoding="utf-8") as fh:
+    with _lp_open(path, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2, ensure_ascii=False)
 
 

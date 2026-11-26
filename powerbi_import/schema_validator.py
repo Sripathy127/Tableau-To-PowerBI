@@ -28,6 +28,23 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
+# Windows MAX_PATH guard: the generated PBIR tree can exceed 260 chars,
+# where plain open/listdir raise 'not found' and glob silently matches
+# nothing. No-op off Windows and on short paths.
+try:
+    from longpath import (
+        lp_open as _lp_open, listdir as _lp_listdir, walk as _lp_walk,
+        isfile as _lp_isfile, isdir as _lp_isdir, exists as _lp_exists,
+        lp_glob as _lp_glob, makedirs as _lp_makedirs,
+    )
+except ImportError:  # pragma: no cover - import-style fallback
+    from powerbi_import.longpath import (
+        lp_open as _lp_open, listdir as _lp_listdir, walk as _lp_walk,
+        isfile as _lp_isfile, isdir as _lp_isdir, exists as _lp_exists,
+        lp_glob as _lp_glob, makedirs as _lp_makedirs,
+    )
+
+
 logger = logging.getLogger(__name__)
 
 # ── Canonical $schema URLs emitted by pbip_generator.py ─────────────
@@ -451,19 +468,19 @@ def validate_report_dir(definition_dir: str) -> List[SchemaResult]:
     list of SchemaResult — one per validated file.
     """
     results: List[SchemaResult] = []
-    if not os.path.isdir(definition_dir):
+    if not _lp_isdir(definition_dir):
         r = SchemaResult(artifact_type='directory', file_path=definition_dir)
         r.issues.append(SchemaIssue('error', '', 'Directory does not exist'))
         results.append(r)
         return results
 
-    for dirpath, _dirnames, filenames in os.walk(definition_dir):
+    for dirpath, _dirnames, filenames in _lp_walk(definition_dir):
         for fname in filenames:
             if not fname.endswith('.json'):
                 continue
             fpath = os.path.join(dirpath, fname)
             try:
-                with open(fpath, 'r', encoding='utf-8') as f:
+                with _lp_open(fpath, 'r', encoding='utf-8') as f:
                     data = json.load(f)
             except (json.JSONDecodeError, OSError) as exc:
                 r = SchemaResult(artifact_type='unknown', file_path=fpath)

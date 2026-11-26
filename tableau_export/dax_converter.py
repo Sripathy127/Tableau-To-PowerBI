@@ -2021,6 +2021,25 @@ def _is_bare_column_ref(ref):
     return bool(_BARE_COL_REF_RE.match(ref))
 
 
+# Collapsing an INCLUDE grain back to the view's grain needs an iterator that
+# matches the inner aggregate. SUM/MIN/MAX round-trip exactly; AVERAGE is the
+# case that is actually wrong without this. Counts are additive across the extra
+# grain, which matches Tableau's default SUM aggregation for a measure dropped
+# on a shelf.
+_LOD_INCLUDE_ITERATORS = {
+    'SUM': 'SUMX',
+    'AVERAGE': 'AVERAGEX',
+    'MIN': 'MINX',
+    'MAX': 'MAXX',
+    'COUNT': 'SUMX',
+    'COUNTA': 'SUMX',
+    'COUNTROWS': 'SUMX',
+    'DISTINCTCOUNT': 'SUMX',
+}
+
+_LOD_AGG_HEAD_RE = re.compile(r'\s*([A-Za-z_][A-Za-z0-9_.]*)\s*\(')
+
+
 def _convert_lod_expressions(dax, table_name, column_table_map):
     """Convert LOD expressions: {FIXED/INCLUDE/EXCLUDE dims : AGG} → CALCULATE.
 
@@ -2063,7 +2082,23 @@ def _convert_lod_expressions(dax, table_name, column_table_map):
             else:
                 return f"CALCULATE({agg_str}, ALL('{table_name}'))"
         elif keyword == 'INCLUDE':
-            return f"CALCULATE({agg_str})"
+            # {INCLUDE [D] : AGG(x)} evaluates AGG at the view's granularity
+            # *plus* D, then collapses the result back to the view. Dropping D
+            # and emitting a plain CALCULATE is only right when AGG is
+            # additive; for AVERAGE it silently returns the average over rows
+            # instead of the average over D-groups. Materialise the finer grain
+            # with SUMMARIZE and collapse it with the matching iterator.
+            if not dim_refs or not all(_is_bare_column_ref(r) for r in dim_refs):
+                return f"CALCULATE({agg_str})"
+            head = _LOD_AGG_HEAD_RE.match(agg_str)
+            iterator = (_LOD_INCLUDE_ITERATORS.get(head.group(1).upper())
+                        if head else None)
+            if not iterator:
+                # Unrecognised aggregate (nested LOD, arithmetic, custom
+                # expression) — keep the valid coarse form.
+                return f"CALCULATE({agg_str})"
+            return (f"{iterator}(SUMMARIZE('{table_name}', "
+                    f"{', '.join(dim_refs)}), CALCULATE({agg_str}))")
         elif keyword == 'EXCLUDE':
             if dim_refs:
                 if not all(_is_bare_column_ref(r) for r in dim_refs):

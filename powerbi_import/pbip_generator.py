@@ -56,11 +56,27 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import m_query_generator
 import tmdl_generator
 
+# Windows MAX_PATH guard for the deep PBIR page/visual tree. No-op on other
+# platforms and on paths that are comfortably short. Imported flat or as part
+# of the package depending on the caller.
+try:
+    from longpath import (
+        makedirs as _lp_makedirs, lp_open as _lp_open,
+        listdir as _lp_listdir, walk as _lp_walk, remove as _lp_remove,
+        rmdir as _lp_rmdir, rmtree as _lp_rmtree, copy2 as _lp_copy2,
+    )
+except ImportError:  # pragma: no cover - import-style fallback
+    from powerbi_import.longpath import (
+        makedirs as _lp_makedirs, lp_open as _lp_open,
+        listdir as _lp_listdir, walk as _lp_walk, remove as _lp_remove,
+        rmdir as _lp_rmdir, rmtree as _lp_rmtree, copy2 as _lp_copy2,
+    )
+
 
 def _write_json(filepath, data, ensure_ascii=True):
     """Write a JSON file, creating parent directories as needed."""
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    with open(filepath, 'w', encoding='utf-8') as f:
+    _lp_makedirs(os.path.dirname(filepath), exist_ok=True)
+    with _lp_open(filepath, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2, ensure_ascii=ensure_ascii)
 
 
@@ -76,7 +92,7 @@ def _rmtree_with_retry(path, attempts=3, delay=0.5):
     """
     for attempt in range(attempts):
         try:
-            shutil.rmtree(path)
+            _lp_rmtree(path)
             return True
         except PermissionError:
             if attempt < attempts - 1:
@@ -219,7 +235,7 @@ class PowerBIProjectGenerator:
         self._equivalence_report = None
         self.last_phase_timings = None
         
-        os.makedirs(self.output_dir, exist_ok=True)
+        _lp_makedirs(self.output_dir, exist_ok=True)
     
     def generate_project(self, report_name, converted_objects, calendar_start=None,
                          calendar_end=None, culture=None, model_mode='import',
@@ -274,7 +290,7 @@ class PowerBIProjectGenerator:
         
         # Create project structure
         project_dir = os.path.join(self.output_dir, report_name)
-        os.makedirs(project_dir, exist_ok=True)
+        _lp_makedirs(project_dir, exist_ok=True)
         
         # 1. Create the .pbip file
         with phase_timings.phase('project_manifest'):
@@ -513,7 +529,7 @@ class PowerBIProjectGenerator:
         
         # Also create the .gitignore
         gitignore = os.path.join(project_dir, '.gitignore')
-        with open(gitignore, 'w', encoding='utf-8') as f:
+        with _lp_open(gitignore, 'w', encoding='utf-8') as f:
             f.write(".pbi/\n")
         
         return pbip_file
@@ -522,7 +538,7 @@ class PowerBIProjectGenerator:
         """Creates the SemanticModel structure (format identical to PBI Hero reference)"""
         
         sm_dir = os.path.join(project_dir, f"{report_name}.SemanticModel")
-        os.makedirs(sm_dir, exist_ok=True)
+        _lp_makedirs(sm_dir, exist_ok=True)
         
         # 1. Create .platform
         platform = {
@@ -917,7 +933,7 @@ class PowerBIProjectGenerator:
                 height=position.get('height', 300),
                 z_index=visual_count,
             )
-            os.makedirs(visual_dir, exist_ok=True)
+            _lp_makedirs(visual_dir, exist_ok=True)
             _write_json(os.path.join(visual_dir, 'visual.json'), container, ensure_ascii=False)
             return
 
@@ -1960,25 +1976,25 @@ class PowerBIProjectGenerator:
         if os.path.exists(report_dir):
             for attempt in range(5):
                 try:
-                    shutil.rmtree(report_dir)
+                    _lp_rmtree(report_dir)
                     break
                 except PermissionError:
                     if attempt < 4:
                         time.sleep(0.5 * (attempt + 1))
                     else:
                         # Last resort: remove files individually, skip locked ones
-                        for root, dirs, files in os.walk(report_dir, topdown=False):
+                        for root, dirs, files in _lp_walk(report_dir, topdown=False):
                             for name in files:
                                 try:
-                                    os.remove(os.path.join(root, name))
+                                    _lp_remove(os.path.join(root, name))
                                 except PermissionError as exc:
                                     logger.debug("Could not remove locked file %s: %s", os.path.join(root, name), exc)
                             for name in dirs:
                                 try:
-                                    os.rmdir(os.path.join(root, name))
+                                    _lp_rmdir(os.path.join(root, name))
                                 except (PermissionError, OSError) as exc:
                                     logger.debug("Could not remove directory %s: %s", os.path.join(root, name), exc)
-        os.makedirs(report_dir, exist_ok=True)
+        _lp_makedirs(report_dir, exist_ok=True)
         
         # 1. .platform
         platform = {
@@ -2008,7 +2024,7 @@ class PowerBIProjectGenerator:
         
         # 3. definition/ folder
         def_dir = os.path.join(report_dir, 'definition')
-        os.makedirs(def_dir, exist_ok=True)
+        _lp_makedirs(def_dir, exist_ok=True)
         
         # 3a. version.json
         version_json = {
@@ -2101,7 +2117,7 @@ class PowerBIProjectGenerator:
         
         # 4. Create pages with visuals
         pages_dir = os.path.join(def_dir, 'pages')
-        os.makedirs(pages_dir, exist_ok=True)
+        _lp_makedirs(pages_dir, exist_ok=True)
         
         worksheets = converted_objects.get('worksheets', [])
         
@@ -2162,7 +2178,7 @@ class PowerBIProjectGenerator:
         valid_page_set = set(page_names)
         stale_count = 0
         if os.path.isdir(pages_dir):
-            for entry in os.listdir(pages_dir):
+            for entry in _lp_listdir(pages_dir):
                 entry_path = os.path.join(pages_dir, entry)
                 if not os.path.isdir(entry_path):
                     continue
@@ -2177,7 +2193,7 @@ class PowerBIProjectGenerator:
                 # For valid pages, remove stale visual subdirs without visual.json
                 visuals_dir = os.path.join(entry_path, 'visuals')
                 if os.path.isdir(visuals_dir):
-                    for vdir in os.listdir(visuals_dir):
+                    for vdir in _lp_listdir(visuals_dir):
                         vpath = os.path.join(visuals_dir, vdir)
                         if os.path.isdir(vpath) and not os.path.exists(os.path.join(vpath, 'visual.json')):
                             _rmtree_with_retry(vpath)
@@ -2224,7 +2240,7 @@ class PowerBIProjectGenerator:
             self._build_field_mapping(converted_objects)
 
         def_dir = os.path.join(report_dir, 'definition')
-        os.makedirs(def_dir, exist_ok=True)
+        _lp_makedirs(def_dir, exist_ok=True)
 
         # version.json
         version_json = {
@@ -2296,7 +2312,7 @@ class PowerBIProjectGenerator:
 
         # Pages
         pages_dir = os.path.join(def_dir, 'pages')
-        os.makedirs(pages_dir, exist_ok=True)
+        _lp_makedirs(pages_dir, exist_ok=True)
         worksheets = converted_objects.get('worksheets', [])
         page_names = []
         tooltip_page_map = {}
@@ -2362,7 +2378,7 @@ class PowerBIProjectGenerator:
 
             # Create the page folder
             page_dir = os.path.join(pages_dir, page_name)
-            os.makedirs(page_dir, exist_ok=True)
+            _lp_makedirs(page_dir, exist_ok=True)
 
             # Get the size
             size = db.get('size', {})
@@ -2432,7 +2448,7 @@ class PowerBIProjectGenerator:
 
             # Create visuals
             visuals_dir = os.path.join(page_dir, 'visuals')
-            os.makedirs(visuals_dir, exist_ok=True)
+            _lp_makedirs(visuals_dir, exist_ok=True)
 
             db_objects = db.get('objects', [])
             visual_count = 0
@@ -2578,7 +2594,7 @@ class PowerBIProjectGenerator:
             page_name = "ReportSection"
             page_names.append(page_name)
             page_dir = os.path.join(pages_dir, page_name)
-            os.makedirs(page_dir, exist_ok=True)
+            _lp_makedirs(page_dir, exist_ok=True)
             page_json = {
                 "$schema": SCHEMA_PAGE,
                 "name": page_name,
@@ -2588,7 +2604,7 @@ class PowerBIProjectGenerator:
                 "width": 1280
             }
             _write_json(os.path.join(page_dir, 'page.json'), page_json)
-            os.makedirs(os.path.join(page_dir, 'visuals'), exist_ok=True)
+            _lp_makedirs(os.path.join(page_dir, 'visuals'), exist_ok=True)
             print(f"  ðŸ“Š Default page: 0 visuals created")
             return page_names
 
@@ -2598,7 +2614,7 @@ class PowerBIProjectGenerator:
 
             ws_name = ws.get('name', f'Sheet {idx+1}')
             page_dir = os.path.join(pages_dir, page_name)
-            os.makedirs(page_dir, exist_ok=True)
+            _lp_makedirs(page_dir, exist_ok=True)
 
             page_json = {
                 "$schema": SCHEMA_PAGE,
@@ -2611,7 +2627,7 @@ class PowerBIProjectGenerator:
             _write_json(os.path.join(page_dir, 'page.json'), page_json)
 
             visuals_dir = os.path.join(page_dir, 'visuals')
-            os.makedirs(visuals_dir, exist_ok=True)
+            _lp_makedirs(visuals_dir, exist_ok=True)
 
             visual_id = uuid.uuid4().hex[:20]
             visual_dir = os.path.join(visuals_dir, visual_id)
@@ -2765,7 +2781,7 @@ class PowerBIProjectGenerator:
                         tooltip_page_map[tip.get('worksheet', '')] = tip_name
 
             tip_dir = os.path.join(pages_dir, tip_name)
-            os.makedirs(tip_dir, exist_ok=True)
+            _lp_makedirs(tip_dir, exist_ok=True)
 
             tip_page = {
                 "$schema": SCHEMA_PAGE,
@@ -2780,7 +2796,7 @@ class PowerBIProjectGenerator:
 
             # Create a visual for the tooltip
             tip_visuals_dir = os.path.join(tip_dir, 'visuals')
-            os.makedirs(tip_visuals_dir, exist_ok=True)
+            _lp_makedirs(tip_visuals_dir, exist_ok=True)
             self._create_visual_worksheet(
                 tip_visuals_dir, tip_ws,
                 {'type': 'worksheetReference', 'worksheetName': tip_ws.get('name', ''),
@@ -2801,7 +2817,7 @@ class PowerBIProjectGenerator:
                     page_names.append(mobile_page_name)
 
                     mobile_dir = os.path.join(pages_dir, mobile_page_name)
-                    os.makedirs(mobile_dir, exist_ok=True)
+                    _lp_makedirs(mobile_dir, exist_ok=True)
 
                     mobile_page = {
                         "$schema": SCHEMA_PAGE,
@@ -2815,7 +2831,7 @@ class PowerBIProjectGenerator:
 
                     # Create visuals for visible zones
                     mobile_visuals_dir = os.path.join(mobile_dir, 'visuals')
-                    os.makedirs(mobile_visuals_dir, exist_ok=True)
+                    _lp_makedirs(mobile_visuals_dir, exist_ok=True)
 
                     vis_count = 0
                     for zone in dl.get('zones', []):
@@ -3940,7 +3956,7 @@ class PowerBIProjectGenerator:
         for bm in bookmarks:
             bm_name = bm["name"]
             bm_dir = os.path.join(bookmarks_dir, bm_name)
-            os.makedirs(bm_dir, exist_ok=True)
+            _lp_makedirs(bm_dir, exist_ok=True)
             bookmark_json = {
                 "$schema": SCHEMA_BOOKMARK,
                 "name": bm["name"],
@@ -3980,7 +3996,7 @@ class PowerBIProjectGenerator:
             return
 
         res_dir = os.path.join(def_dir, 'RegisteredResources')
-        os.makedirs(res_dir, exist_ok=True)
+        _lp_makedirs(res_dir, exist_ok=True)
 
         copied = 0
         for shape in shapes:
@@ -3991,7 +4007,7 @@ class PowerBIProjectGenerator:
             if os.path.isfile(src_path):
                 dst_path = os.path.join(res_dir, filename)
                 try:
-                    shutil.copy2(src_path, dst_path)
+                    _lp_copy2(src_path, dst_path)
                     copied += 1
                 except (OSError, PermissionError) as exc:
                     logger.debug("Could not copy shape %s: %s", filename, exc)
@@ -5274,7 +5290,7 @@ class PowerBIProjectGenerator:
         """
         visual_id = uuid.uuid4().hex[:20]
         visual_dir = os.path.join(visuals_dir, visual_id)
-        os.makedirs(visual_dir, exist_ok=True)
+        _lp_makedirs(visual_dir, exist_ok=True)
 
         nav_height = 40
         visual_json = {
@@ -5317,7 +5333,7 @@ class PowerBIProjectGenerator:
         table_name = self._find_column_table(field, converted_objects)
         visual_id = uuid.uuid4().hex[:20]
         visual_dir = os.path.join(visuals_dir, visual_id)
-        os.makedirs(visual_dir, exist_ok=True)
+        _lp_makedirs(visual_dir, exist_ok=True)
         slicer = self._create_slicer_visual(
             visual_id, 10, 10, 400, 50, field, table_name, visual_count)
         slicer.setdefault('visual', {}).setdefault('objects', {})
@@ -5401,7 +5417,7 @@ class PowerBIProjectGenerator:
             page_names.append(dt_page_name)
 
             dt_dir = os.path.join(pages_dir, dt_page_name)
-            os.makedirs(dt_dir, exist_ok=True)
+            _lp_makedirs(dt_dir, exist_ok=True)
 
             dt_page = {
                 "$schema": SCHEMA_PAGE,
@@ -5435,7 +5451,7 @@ class PowerBIProjectGenerator:
 
             # Create visuals on the drill-through page
             dt_visuals_dir = os.path.join(dt_dir, 'visuals')
-            os.makedirs(dt_visuals_dir, exist_ok=True)
+            _lp_makedirs(dt_visuals_dir, exist_ok=True)
             self._create_visual_worksheet(
                 dt_visuals_dir, ws_data,
                 {'type': 'worksheetReference', 'worksheetName': target_ws,
@@ -5564,7 +5580,7 @@ class PowerBIProjectGenerator:
         visuals_count = 0
         report_def = os.path.join(project_dir, f"{report_name}.Report", "definition", "pages")
         if os.path.isdir(report_def):
-            for entry in os.listdir(report_def):
+            for entry in _lp_listdir(report_def):
                 entry_path = os.path.join(report_def, entry)
                 # Only count pages that have page.json (skip stale leftovers)
                 if (os.path.isdir(entry_path) and entry.startswith('ReportSection')
@@ -5573,7 +5589,7 @@ class PowerBIProjectGenerator:
                     vis_dir = os.path.join(entry_path, 'visuals')
                     if os.path.isdir(vis_dir):
                         # Only count visual dirs that have visual.json
-                        visuals_count += len([d for d in os.listdir(vis_dir)
+                        visuals_count += len([d for d in _lp_listdir(vis_dir)
                                               if os.path.isdir(os.path.join(vis_dir, d))
                                               and os.path.isfile(os.path.join(vis_dir, d, 'visual.json'))])
 
@@ -5588,16 +5604,16 @@ class PowerBIProjectGenerator:
         tables_dir = os.path.join(project_dir, f"{report_name}.SemanticModel",
                                   "definition", "tables")
         if os.path.isdir(tables_dir):
-            tmdl_stats['tables'] = len([f for f in os.listdir(tables_dir) if f.endswith('.tmdl')])
+            tmdl_stats['tables'] = len([f for f in _lp_listdir(tables_dir) if f.endswith('.tmdl')])
 
         # Count measures and relationships from TMDL files
         measures_count = 0
         columns_count = 0
         if os.path.isdir(tables_dir):
-            for tmdl_file in os.listdir(tables_dir):
+            for tmdl_file in _lp_listdir(tables_dir):
                 if tmdl_file.endswith('.tmdl'):
                     try:
-                        with open(os.path.join(tables_dir, tmdl_file), 'r', encoding='utf-8') as f:
+                        with _lp_open(os.path.join(tables_dir, tmdl_file), 'r', encoding='utf-8') as f:
                             content = f.read()
                         measures_count += content.count('\n\tmeasure ')
                         columns_count += content.count('\n\tcolumn ')
@@ -5611,7 +5627,7 @@ class PowerBIProjectGenerator:
                                  "definition", "relationships.tmdl")
         if os.path.isfile(rels_path):
             try:
-                with open(rels_path, 'r', encoding='utf-8') as f:
+                with _lp_open(rels_path, 'r', encoding='utf-8') as f:
                     content = f.read()
                 relationships_count = content.count('\nrelationship ')
             except (IOError, OSError) as exc:
@@ -5732,7 +5748,7 @@ class PowerBIProjectGenerator:
         """
         pag_dir = os.path.join(project_dir, 'PaginatedReport')
         pages_dir = os.path.join(pag_dir, 'pages')
-        os.makedirs(pages_dir, exist_ok=True)
+        _lp_makedirs(pages_dir, exist_ok=True)
 
         # --- Report-level definition ---
         report_def = {

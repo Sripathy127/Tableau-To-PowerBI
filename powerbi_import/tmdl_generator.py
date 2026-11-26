@@ -28,6 +28,16 @@ Generated structure:
 import sys
 import os
 import re
+
+# Windows MAX_PATH guard (no-op elsewhere / on short paths). This module is
+# imported both flat (via pbip_generator's sys.path insert) and as
+# powerbi_import.tmdl_generator, so accept either form.
+try:
+    from longpath import makedirs as _lp_makedirs, lp_open as _lp_open
+except ImportError:  # pragma: no cover - import-style fallback
+    from powerbi_import.longpath import (
+        makedirs as _lp_makedirs, lp_open as _lp_open,
+    )
 import uuid
 import json
 import logging
@@ -6322,7 +6332,7 @@ def _write_tmdl_files(model_data, output_dir):
     model = model_data.get('model', model_data)
 
     def_dir = os.path.join(output_dir, 'definition')
-    os.makedirs(def_dir, exist_ok=True)
+    _lp_makedirs(def_dir, exist_ok=True)
 
     tables = model.get('tables', [])
     relationships = model.get('relationships', [])
@@ -6363,7 +6373,7 @@ def _write_tmdl_files(model_data, output_dir):
 
     # 6. tables/*.tmdl
     tables_dir = os.path.join(def_dir, 'tables')
-    os.makedirs(tables_dir, exist_ok=True)
+    _lp_makedirs(tables_dir, exist_ok=True)
 
     # Clean stale table files from previous runs
     expected_files = set()
@@ -6391,7 +6401,7 @@ def _write_tmdl_files(model_data, output_dir):
 
     # 7. diagramLayout.json (empty — Power BI Desktop fills it on first open)
     diagram_path = os.path.join(def_dir, 'diagramLayout.json')
-    with open(diagram_path, 'w', encoding='utf-8') as f:
+    with _lp_open(diagram_path, 'w', encoding='utf-8') as f:
         json.dump({}, f)
 
     # 8. perspectives.tmdl (auto-generated from table groupings)
@@ -6409,12 +6419,12 @@ def _write_tmdl_files(model_data, output_dir):
     linguistic_synonyms = model.get('_linguistic_synonyms', {})
     if culture and culture != 'en-US':
         cultures_dir = os.path.join(def_dir, 'cultures')
-        os.makedirs(cultures_dir, exist_ok=True)
+        _lp_makedirs(cultures_dir, exist_ok=True)
         _write_culture_tmdl(cultures_dir, culture, tables, linguistic_synonyms=linguistic_synonyms)
     elif linguistic_synonyms:
         # Even for en-US, write culture with synonyms for Q&A
         cultures_dir = os.path.join(def_dir, 'cultures')
-        os.makedirs(cultures_dir, exist_ok=True)
+        _lp_makedirs(cultures_dir, exist_ok=True)
         _write_culture_tmdl(cultures_dir, 'en-US', tables, linguistic_synonyms=linguistic_synonyms)
 
     # 9b. Additional language cultures (--languages flag)
@@ -6456,7 +6466,7 @@ def _write_perspectives_tmdl(def_dir, perspectives):
         lines.append("")
 
     filepath = os.path.join(def_dir, 'perspectives.tmdl')
-    with open(filepath, 'w', encoding='utf-8') as f:
+    with _lp_open(filepath, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines))
 
 
@@ -6545,7 +6555,7 @@ def _write_culture_tmdl(cultures_dir, culture_name, tables, linguistic_synonyms=
         lines.append("")
 
     filepath = os.path.join(cultures_dir, f'{culture_name}.tmdl')
-    with open(filepath, 'w', encoding='utf-8') as f:
+    with _lp_open(filepath, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines))
 
 
@@ -6565,7 +6575,7 @@ def _write_multi_language_cultures(def_dir, languages, tables):
         return
 
     cultures_dir = os.path.join(def_dir, 'cultures')
-    os.makedirs(cultures_dir, exist_ok=True)
+    _lp_makedirs(cultures_dir, exist_ok=True)
 
     for locale in locales:
         if locale == 'en-US':
@@ -6855,7 +6865,7 @@ def _write_database_tmdl(def_dir, model):
     content = f"database\n\tcompatibilityLevel: {compat}\n\n"
 
     filepath = os.path.join(def_dir, 'database.tmdl')
-    with open(filepath, 'w', encoding='utf-8') as f:
+    with _lp_open(filepath, 'w', encoding='utf-8') as f:
         f.write(content)
 
 
@@ -6927,7 +6937,7 @@ def _write_model_tmdl(def_dir, model, tables, roles=None, relationships=None):
     content = '\n'.join(lines) + '\n'
 
     filepath = os.path.join(def_dir, 'model.tmdl')
-    with open(filepath, 'w', encoding='utf-8') as f:
+    with _lp_open(filepath, 'w', encoding='utf-8') as f:
         f.write(content)
 
 
@@ -7039,7 +7049,7 @@ def _write_expressions_tmdl(def_dir, tables, datasources=None, incremental_param
     content = '\n'.join(lines) + '\n'
 
     filepath = os.path.join(def_dir, 'expressions.tmdl')
-    with open(filepath, 'w', encoding='utf-8') as f:
+    with _lp_open(filepath, 'w', encoding='utf-8') as f:
         f.write(content)
 
 
@@ -7086,7 +7096,7 @@ def _write_roles_tmdl(def_dir, roles):
     content = '\n'.join(lines) + '\n'
 
     filepath = os.path.join(def_dir, 'roles.tmdl')
-    with open(filepath, 'w', encoding='utf-8') as f:
+    with _lp_open(filepath, 'w', encoding='utf-8') as f:
         f.write(content)
 
 
@@ -7094,7 +7104,7 @@ def _write_relationships_tmdl(def_dir, relationships):
     """Generate relationships.tmdl."""
     if not relationships:
         filepath = os.path.join(def_dir, 'relationships.tmdl')
-        with open(filepath, 'w', encoding='utf-8') as f:
+        with _lp_open(filepath, 'w', encoding='utf-8') as f:
             f.write("")
         return
 
@@ -7135,7 +7145,7 @@ def _write_relationships_tmdl(def_dir, relationships):
     content = '\n'.join(lines) + '\n'
 
     filepath = os.path.join(def_dir, 'relationships.tmdl')
-    with open(filepath, 'w', encoding='utf-8') as f:
+    with _lp_open(filepath, 'w', encoding='utf-8') as f:
         f.write(content)
 
 
@@ -7327,7 +7337,7 @@ def _write_table_tmdl(tables_dir, table):
 
     filename = _safe_filename(table_name) + '.tmdl'
     filepath = os.path.join(tables_dir, filename)
-    with open(filepath, 'w', encoding='utf-8') as f:
+    with _lp_open(filepath, 'w', encoding='utf-8') as f:
         f.write(content)
 
 
@@ -7904,7 +7914,7 @@ def _write_direct_lake_expression(def_dir, direct_lake):
         '',
     ]
     path = os.path.join(def_dir, 'expressions.tmdl')
-    with open(path, 'w', encoding='utf-8') as f:
+    with _lp_open(path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines))
 
 

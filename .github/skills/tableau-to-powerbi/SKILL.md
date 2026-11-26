@@ -62,6 +62,22 @@ Run `.venv\Scripts\python.exe migrate.py --help` for the concise list. Existing
 flag-based automation remains compatible; `--advanced-help` exposes legacy options.
 Never put credentials in chat or command arguments; use environment variables.
 
+### Equivalent flag forms
+
+Older scripts call the same operations as flags on `migrate.py`. Both forms are
+supported, so prefer whichever matches the automation already in place:
+
+| Subcommand | Flag form | Does |
+|---|---|---|
+| `migrate.py assess wb.twbx` | `migrate.py wb.twbx --assess` | Readiness assessment, no artifacts written |
+| `migrate.py qa wb.twbx` | `migrate.py wb.twbx --qa` | Deeper QA / parity suite after migration |
+| `migrate.py batch folder` | `migrate.py --batch folder` | Migrate every workbook in a folder |
+| — | `--output-dir C:\pbi` | Where the `.pbip` is written (keep it short; see below) |
+
+Keep `--output-dir` shallow. PBIR nests pages and visuals deeply, and although
+the tool now writes past Windows' 260-character `MAX_PATH`, Power BI Desktop
+itself still refuses to open a project buried that deep. `C:\pbi` is a safe root.
+
 ## What you get (output layout)
 
 A generated `.pbip` project contains:

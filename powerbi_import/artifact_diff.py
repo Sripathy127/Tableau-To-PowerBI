@@ -28,6 +28,23 @@ import re
 import shutil
 from datetime import datetime
 
+# Windows MAX_PATH guard: the generated PBIR tree can exceed 260 chars,
+# where plain open/listdir raise 'not found' and glob silently matches
+# nothing. No-op off Windows and on short paths.
+try:
+    from longpath import (
+        lp_open as _lp_open, listdir as _lp_listdir, walk as _lp_walk,
+        isfile as _lp_isfile, isdir as _lp_isdir, exists as _lp_exists,
+        lp_glob as _lp_glob, makedirs as _lp_makedirs,
+    )
+except ImportError:  # pragma: no cover - import-style fallback
+    from powerbi_import.longpath import (
+        lp_open as _lp_open, listdir as _lp_listdir, walk as _lp_walk,
+        isfile as _lp_isfile, isdir as _lp_isdir, exists as _lp_exists,
+        lp_glob as _lp_glob, makedirs as _lp_makedirs,
+    )
+
+
 logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -148,8 +165,8 @@ class DiffReport:
 
     def save(self, path):
         """Write diff report as JSON."""
-        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
-        with open(path, 'w', encoding='utf-8') as f:
+        _lp_makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        with _lp_open(path, 'w', encoding='utf-8') as f:
             json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
 
 
@@ -187,7 +204,7 @@ def _parse_tmdl_table(filepath):
                partitions: [{name, content_hash}]}
     """
     try:
-        with open(filepath, 'r', encoding='utf-8') as f:
+        with _lp_open(filepath, 'r', encoding='utf-8') as f:
             text = f.read()
     except OSError:
         return None
@@ -298,7 +315,7 @@ def _parse_tmdl_table(filepath):
 def _parse_relationships(filepath):
     """Parse relationships.tmdl and return list of relationship dicts."""
     try:
-        with open(filepath, 'r', encoding='utf-8') as f:
+        with _lp_open(filepath, 'r', encoding='utf-8') as f:
             text = f.read()
     except OSError:
         return []
@@ -346,7 +363,7 @@ def _parse_relationships(filepath):
 def _parse_roles(filepath):
     """Parse roles.tmdl and return list of role dicts."""
     try:
-        with open(filepath, 'r', encoding='utf-8') as f:
+        with _lp_open(filepath, 'r', encoding='utf-8') as f:
             text = f.read()
     except OSError:
         return []
@@ -379,7 +396,7 @@ def _parse_roles(filepath):
 def _load_json(filepath):
     """Safely load a JSON file."""
     try:
-        with open(filepath, 'r', encoding='utf-8') as f:
+        with _lp_open(filepath, 'r', encoding='utf-8') as f:
             return json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
@@ -393,12 +410,12 @@ def _load_pages(report_dir):
     """
     pages = {}
     pages_dir = os.path.join(report_dir, 'definition', 'pages')
-    if not os.path.isdir(pages_dir):
+    if not _lp_isdir(pages_dir):
         return pages
 
-    for page_folder in sorted(os.listdir(pages_dir)):
+    for page_folder in sorted(_lp_listdir(pages_dir)):
         page_json_path = os.path.join(pages_dir, page_folder, 'page.json')
-        if not os.path.isfile(page_json_path):
+        if not _lp_isfile(page_json_path):
             continue
         page_data = _load_json(page_json_path)
         if not page_data:
@@ -410,10 +427,10 @@ def _load_pages(report_dir):
         # Load visuals
         visuals = []
         visuals_dir = os.path.join(pages_dir, page_folder, 'visuals')
-        if os.path.isdir(visuals_dir):
-            for vis_folder in sorted(os.listdir(visuals_dir)):
+        if _lp_isdir(visuals_dir):
+            for vis_folder in sorted(_lp_listdir(visuals_dir)):
                 vis_json_path = os.path.join(visuals_dir, vis_folder, 'visual.json')
-                if not os.path.isfile(vis_json_path):
+                if not _lp_isfile(vis_json_path):
                     continue
                 vis_data = _load_json(vis_json_path)
                 if not vis_data:
@@ -498,18 +515,18 @@ def _load_report_filters(report_dir):
 
 def _find_semantic_model_dir(project_dir):
     """Locate the .SemanticModel directory within a .pbip project."""
-    for item in os.listdir(project_dir):
+    for item in _lp_listdir(project_dir):
         full = os.path.join(project_dir, item)
-        if item.endswith('.SemanticModel') and os.path.isdir(full):
+        if item.endswith('.SemanticModel') and _lp_isdir(full):
             return full
     return None
 
 
 def _find_report_dir(project_dir):
     """Locate the .Report directory within a .pbip project."""
-    for item in os.listdir(project_dir):
+    for item in _lp_listdir(project_dir):
         full = os.path.join(project_dir, item)
-        if item.endswith('.Report') and os.path.isdir(full):
+        if item.endswith('.Report') and _lp_isdir(full):
             return full
     return None
 
@@ -535,8 +552,8 @@ def load_project(project_dir):
         tables_dir = os.path.join(defn_dir, 'tables')
 
         # Parse tables
-        if os.path.isdir(tables_dir):
-            for tmdl_file in sorted(glob.glob(os.path.join(tables_dir, '*.tmdl'))):
+        if _lp_isdir(tables_dir):
+            for tmdl_file in sorted(_lp_glob(os.path.join(tables_dir, '*.tmdl'))):
                 table = _parse_tmdl_table(tmdl_file)
                 if table:
                     result['tables'][table['name']] = table
@@ -838,7 +855,7 @@ def save_baseline(project_dir, baseline_dir):
     Returns:
         str: Path to the baseline directory
     """
-    if os.path.isdir(baseline_dir):
+    if _lp_isdir(baseline_dir):
         shutil.rmtree(baseline_dir)
     shutil.copytree(project_dir, baseline_dir)
 
@@ -849,7 +866,7 @@ def save_baseline(project_dir, baseline_dir):
         'version': '1.0',
     }
     manifest_path = os.path.join(baseline_dir, BASELINE_MANIFEST)
-    with open(manifest_path, 'w', encoding='utf-8') as f:
+    with _lp_open(manifest_path, 'w', encoding='utf-8') as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
 
     return baseline_dir
@@ -865,7 +882,7 @@ def check_baseline(project_dir, baseline_dir):
     Returns:
         tuple: (passed: bool, report: DiffReport)
     """
-    if not os.path.isdir(baseline_dir):
+    if not _lp_isdir(baseline_dir):
         logger.warning("No baseline found at %s", baseline_dir)
         return False, DiffReport(old_path=baseline_dir, new_path=project_dir)
 
@@ -941,8 +958,8 @@ def generate_diff_report(report, output_path=None):
         html += '<p>The two projects are identical.</p></div>\n'
         html += html_close()
         if output_path:
-            os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
-            with open(output_path, 'w', encoding='utf-8') as f:
+            _lp_makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+            with _lp_open(output_path, 'w', encoding='utf-8') as f:
                 f.write(html)
         return html
 
@@ -1030,8 +1047,8 @@ def generate_diff_report(report, output_path=None):
     html += html_close()
 
     if output_path:
-        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
-        with open(output_path, 'w', encoding='utf-8') as f:
+        _lp_makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+        with _lp_open(output_path, 'w', encoding='utf-8') as f:
             f.write(html)
         logger.info("Diff report written to %s", output_path)
 

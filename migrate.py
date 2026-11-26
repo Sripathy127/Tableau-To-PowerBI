@@ -26,6 +26,17 @@ import concurrent.futures
 from datetime import datetime
 from enum import IntEnum
 
+# Windows MAX_PATH guard. lp_* are identity functions off Windows and on
+# any path under ~200 chars, so this is inert for ordinary output dirs and
+# only engages for the deep PBIR tree.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'powerbi_import'))
+from longpath import (  # noqa: E402
+    lp_open as _lp_open, listdir as _lp_listdir, walk as _lp_walk,
+    isfile as _lp_isfile, isdir as _lp_isdir, exists as _lp_exists,
+    lp_glob as _lp_glob, makedirs as _lp_makedirs, at_risk as _path_at_risk,
+)
+
+
 
 # ── Structured exit codes ────────────────────────────────────────────
 
@@ -94,7 +105,7 @@ def setup_logging(verbose=False, log_file=None, quiet=False):
 
     handlers = [logging.StreamHandler(sys.stdout)]
     if log_file:
-        os.makedirs(os.path.dirname(log_file) or '.', exist_ok=True)
+        _lp_makedirs(os.path.dirname(log_file) or '.', exist_ok=True)
         handlers.append(logging.FileHandler(log_file, encoding='utf-8'))
 
     logging.basicConfig(level=level, format=fmt, datefmt=datefmt, handlers=handlers)
@@ -125,6 +136,11 @@ class MigrationStats:
         self.hierarchies = 0
         self.user_filters = 0
         self.custom_sql = 0
+        # Source provenance, carried from extraction to the extraction report
+        self.source_file = ""
+        self.extract_dir = ""
+        self.extraction_warnings = []
+        self.extraction_report_path = ""
         # Generation
         self.tmdl_tables = 0
         self.tmdl_columns = 0
@@ -186,7 +202,7 @@ def run_extraction(tableau_file, hyper_max_rows=None):
         print(f"Error: Unsupported file type: {ext}. Use .twb, .twbx, .tds, .tdsx, .tfl, or .tflx")
         return False
 
-    if not os.path.exists(resolved):
+    if not _lp_exists(resolved):
         logger.error(f"Tableau file not found: {resolved}")
         print(f"Error: Tableau file not found: {resolved}")
         return False
@@ -240,13 +256,20 @@ def run_extraction(tableau_file, hyper_max_rows=None):
                 ('custom_sql', 'custom_sql.json'),
             ]:
                 fpath = os.path.join(json_dir, fname)
-                if os.path.exists(fpath):
+                if _lp_exists(fpath):
                     try:
-                        with open(fpath, 'r', encoding='utf-8') as f:
+                        with _lp_open(fpath, 'r', encoding='utf-8') as f:
                             data = json.load(f)
                         setattr(_stats, attr, len(data) if isinstance(data, list) else 0)
                     except (json.JSONDecodeError, OSError) as e:
                         logger.debug("Could not load stats from %s: %s", fname, e)
+
+            # Remember what the extraction report needs; it is written later,
+            # in the generation step, so it lands beside the .pbip project.
+            _stats.source_file = tableau_file
+            _stats.extract_dir = json_dir
+            _stats.extraction_warnings = list(
+                getattr(extractor, 'extraction_warnings', []) or [])
 
             print("\n✓ Extraction completed successfully")
             return True
@@ -301,7 +324,7 @@ def _run_fabric_generation(report_name=None, output_dir=None,
         )
 
         project_dir = results.get('project_path', '')
-        if project_dir and os.path.exists(project_dir):
+        if project_dir and _lp_exists(project_dir):
             _stats.pbip_path = project_dir
             sm = results.get('artifacts', {}).get('semantic_model', {})
             _stats.tmdl_tables = sm.get('tables', 0)
@@ -340,6 +363,16 @@ def run_generation(report_name=None, output_dir=None, calendar_start=None,
     """
     print_step(2, 2, "POWER BI PROJECT GENERATION")
 
+    # Generation itself is long-path safe, but Power BI Desktop is not: it
+    # opens a .pbip through plain Win32 calls and will fail on a project
+    # buried this deep. Warn rather than refuse — the files are written
+    # correctly either way, and the user may be staging them for a move.
+    if output_dir and _path_at_risk(output_dir, headroom=120):
+        print(f"\n  [WARN] Output path is {len(os.path.abspath(output_dir))} "
+              f"characters deep.")
+        print("         Migration will complete, but Power BI Desktop may refuse")
+        print("         to open the result. Prefer a short root such as C:\\pbi.")
+
     # ── Fabric-native output format ──────────────────────────────
     if output_format == 'fabric':
         return _run_fabric_generation(
@@ -365,11 +398,11 @@ def run_generation(report_name=None, output_dir=None, calendar_start=None,
         # Collect generation stats from the output
         base_dir = output_dir or os.path.join('artifacts', 'powerbi_projects', 'migrated')
         project_dir = os.path.join(base_dir, report_name or 'Report')
-        if os.path.exists(project_dir):
+        if _lp_exists(project_dir):
             _stats.pbip_path = project_dir
             # Count TMDL tables
             tables_dir = None
-            for root, dirs, files in os.walk(project_dir):
+            for root, dirs, files in _lp_walk(project_dir):
                 if os.path.basename(root) == 'tables':
                     tables_dir = root
                     _stats.tmdl_tables = len([f for f in files if f.endswith('.tmdl')])
@@ -377,13 +410,13 @@ def run_generation(report_name=None, output_dir=None, calendar_start=None,
                 if os.path.basename(root) == 'pages':
                     _stats.pages_generated = sum(
                         1 for d in dirs if d.startswith('ReportSection')
-                        and os.path.isfile(os.path.join(root, d, 'page.json'))
+                        and _lp_isfile(os.path.join(root, d, 'page.json'))
                     )
                 # Count visuals: only UUID dirs that contain visual.json
                 if os.path.basename(root) == 'visuals':
                     _stats.visuals_generated += sum(
                         1 for d in dirs
-                        if os.path.isfile(os.path.join(root, d, 'visual.json'))
+                        if _lp_isfile(os.path.join(root, d, 'visual.json'))
                     )
                 # Check for theme
                 if 'TableauMigrationTheme.json' in files:
@@ -391,9 +424,9 @@ def run_generation(report_name=None, output_dir=None, calendar_start=None,
 
             # Read TMDL stats from metadata if available
             meta_path = os.path.join(project_dir, 'migration_metadata.json')
-            if os.path.exists(meta_path):
+            if _lp_exists(meta_path):
                 try:
-                    with open(meta_path, 'r', encoding='utf-8') as f:
+                    with _lp_open(meta_path, 'r', encoding='utf-8') as f:
                         meta = json.load(f)
                     tmdl = meta.get('tmdl_stats', {})
                     _stats.tmdl_columns = tmdl.get('columns', 0)
@@ -404,6 +437,10 @@ def run_generation(report_name=None, output_dir=None, calendar_start=None,
                 except (json.JSONDecodeError, OSError, KeyError) as e:
                     logger.debug("Could not load TMDL stats: %s", e)
 
+        # Markdown inventory of the source workbook, written beside the
+        # project so the two can be read together during review.
+        _write_extraction_report(report_name, project_dir, base_dir)
+
         print("\n✓ Power BI project generated successfully")
         return True
 
@@ -411,6 +448,41 @@ def run_generation(report_name=None, output_dir=None, calendar_start=None,
         logger.error(f"Generation failed: {e}", exc_info=True)
         print(f"\nError during generation: {str(e)}")
         return False
+
+
+def _write_extraction_report(report_name, project_dir, base_dir):
+    """Write EXTRACTION_REPORT.md for the workbook just extracted.
+
+    Never fatal: the report is documentation, and failing to write it must not
+    fail a migration that otherwise succeeded.
+    """
+    extract_dir = _stats.extract_dir or _get_extract_dir()
+    if not _lp_isdir(extract_dir):
+        return None
+
+    target_dir = project_dir if _lp_isdir(project_dir) else base_dir
+    name = report_name or _stats.app_name or 'workbook'
+    out_path = os.path.join(target_dir, 'EXTRACTION_REPORT.md')
+
+    try:
+        sys.path.insert(
+            0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            'tableau_export'))
+        from extraction_report import generate_extraction_report
+
+        generate_extraction_report(
+            extract_dir, out_path,
+            workbook_name=name,
+            source_file=_stats.source_file or None,
+            warnings=_stats.extraction_warnings or None,
+        )
+        _stats.extraction_report_path = out_path
+        print(f"  ✓ Extraction report: {out_path}")
+        return out_path
+    except Exception as e:
+        logger.warning("Could not write extraction report: %s", e)
+        logger.debug("Extraction report traceback", exc_info=True)
+        return None
 
 
 def run_migration_report(report_name, output_dir=None):
@@ -456,9 +528,9 @@ def run_migration_report(report_name, output_dir=None):
         tables_dir = os.path.join(base_dir, report_name,
                                   f'{report_name}.SemanticModel',
                                   'definition', 'tables')
-        if os.path.isdir(tables_dir):
+        if _lp_isdir(tables_dir):
             tmdl_tables = set()
-            for tmdl_file in os.listdir(tables_dir):
+            for tmdl_file in _lp_listdir(tables_dir):
                 if tmdl_file.endswith('.tmdl'):
                     # Table name = file name without .tmdl extension
                     tmdl_tables.add(tmdl_file[:-5])
@@ -537,8 +609,8 @@ def run_migration_report(report_name, output_dir=None):
 def _load_json(filepath):
     """Load a JSON file, returning empty list on failure."""
     try:
-        if os.path.exists(filepath):
-            with open(filepath, 'r', encoding='utf-8') as f:
+        if _lp_exists(filepath):
+            with _lp_open(filepath, 'r', encoding='utf-8') as f:
                 return json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         logger.debug("Could not load JSON %s: %s", filepath, e)
@@ -605,7 +677,7 @@ def run_consolidate_reports(directory):
         int: 0 on success, 1 on failure.
     """
     directory = os.path.abspath(directory)
-    if not os.path.isdir(directory):
+    if not _lp_isdir(directory):
         print(f"Error: Directory not found: {directory}")
         return 1
 
@@ -616,7 +688,7 @@ def run_consolidate_reports(directory):
     # Discover migration report JSON files
     report_files = []
     metadata_files = []
-    for root, _dirs, files in os.walk(directory):
+    for root, _dirs, files in _lp_walk(directory):
         for f in files:
             full = os.path.join(root, f)
             if f.startswith('migration_report_') and f.endswith('.json'):
@@ -635,7 +707,7 @@ def run_consolidate_reports(directory):
 
     for rp in sorted(report_files):
         try:
-            with open(rp, encoding='utf-8') as fh:
+            with _lp_open(rp, encoding='utf-8') as fh:
                 data = json.load(fh)
             name = data.get('report_name', '')
             if not name:
@@ -698,7 +770,7 @@ def _build_calc_map_from_tmdl(report_name, output_dir=None):
                               f'{report_name}.SemanticModel',
                               'definition', 'tables')
 
-    if not os.path.isdir(tables_dir):
+    if not _lp_isdir(tables_dir):
         return calc_map
 
     # TMDL inline format: measure 'Name' = DAX  or  column 'Name' = DAX
@@ -719,12 +791,12 @@ def _build_calc_map_from_tmdl(report_name, output_dir=None):
         name = name.replace("''", "'")
         return name
 
-    for tmdl_file in os.listdir(tables_dir):
+    for tmdl_file in _lp_listdir(tables_dir):
         if not tmdl_file.endswith('.tmdl'):
             continue
         filepath = os.path.join(tables_dir, tmdl_file)
         try:
-            with open(filepath, 'r', encoding='utf-8') as f:
+            with _lp_open(filepath, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
 
             # Collect M-based column names from Table.AddColumn steps in partitions
@@ -800,7 +872,7 @@ def run_prep_flow(prep_file, datasources_json=None):
 
     print_step("1b", 2, "TABLEAU PREP FLOW PARSING")
 
-    if not os.path.exists(prep_file):
+    if not _lp_exists(prep_file):
         print(f"Error: Prep flow file not found: {prep_file}")
         return False
 
@@ -818,8 +890,8 @@ def run_prep_flow(prep_file, datasources_json=None):
         print(f"\n  [OK] {len(prep_datasources)} Prep output(s) parsed")
 
         # Load existing TWB datasources
-        if os.path.exists(datasources_json):
-            with open(datasources_json, 'r', encoding='utf-8') as f:
+        if _lp_exists(datasources_json):
+            with _lp_open(datasources_json, 'r', encoding='utf-8') as f:
                 twb_datasources = _json.load(f)
             print(f"  [OK] {len(twb_datasources)} TWB datasource(s) loaded")
         else:
@@ -830,7 +902,7 @@ def run_prep_flow(prep_file, datasources_json=None):
         merged = merge_prep_with_workbook(prep_datasources, twb_datasources)
 
         # Save merged datasources back
-        with open(datasources_json, 'w', encoding='utf-8') as f:
+        with _lp_open(datasources_json, 'w', encoding='utf-8') as f:
             _json.dump(merged, f, indent=2, ensure_ascii=False)
         print(f"  [OK] {len(merged)} merged datasource(s) saved to {datasources_json}")
 
@@ -860,7 +932,7 @@ def run_standalone_prep(prep_file):
 
     print_step("1", 2, "TABLEAU PREP FLOW (STANDALONE)")
 
-    if not os.path.exists(prep_file):
+    if not _lp_exists(prep_file):
         print(f"Error: Prep flow file not found: {prep_file}")
         return False
 
@@ -876,9 +948,9 @@ def run_standalone_prep(prep_file):
 
         # Write synthetic extraction JSON files
         json_dir = _get_extract_dir()
-        os.makedirs(json_dir, exist_ok=True)
+        _lp_makedirs(json_dir, exist_ok=True)
 
-        with open(os.path.join(json_dir, 'datasources.json'), 'w', encoding='utf-8') as f:
+        with _lp_open(os.path.join(json_dir, 'datasources.json'), 'w', encoding='utf-8') as f:
             _json.dump(prep_datasources, f, indent=2, ensure_ascii=False)
 
         # Write empty placeholder files for the other 16 extracted object types
@@ -891,8 +963,8 @@ def run_standalone_prep(prep_file):
         ]
         for fname in empty_list_files:
             fpath = os.path.join(json_dir, fname)
-            if not os.path.exists(fpath):
-                with open(fpath, 'w', encoding='utf-8') as f:
+            if not _lp_exists(fpath):
+                with _lp_open(fpath, 'w', encoding='utf-8') as f:
                     _json.dump([], f)
 
         print(f"  [OK] Extraction JSON written to {json_dir}")
@@ -1086,7 +1158,7 @@ def _run_check_drift(args):
     current = load_snapshot(json_dir)
 
     # Load previous snapshot
-    if os.path.isdir(snapshot_dir):
+    if _lp_isdir(snapshot_dir):
         previous = load_snapshot(snapshot_dir)
     else:
         previous = {}
@@ -1129,7 +1201,7 @@ def _run_batch_config(args):
     """
     config_path = args.batch_config
     try:
-        with open(config_path, 'r', encoding='utf-8') as f:
+        with _lp_open(config_path, 'r', encoding='utf-8') as f:
             entries = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
         print(f"Error: Cannot load batch config: {exc}")
@@ -1158,7 +1230,7 @@ def _run_batch_config(args):
 
         # Resolve relative paths against config file location
         tableau_file = raw_file if os.path.isabs(raw_file) else os.path.join(config_dir, raw_file)
-        if not os.path.isfile(tableau_file):
+        if not _lp_isfile(tableau_file):
             print(f"  [{i}/{len(entries)}] SKIP — file not found: {raw_file}")
             results[raw_file] = {'success': False, 'error': 'file_not_found'}
             continue
@@ -1238,7 +1310,7 @@ def _run_batch_config(args):
                 'metadata_path': res.get('metadata_path'),
             }
             pattern = os.path.join(effective_output, f'migration_report_{name}_*.json')
-            candidates = sorted(glob.glob(pattern))
+            candidates = sorted(_lp_glob(pattern))
             if candidates:
                 wb_paths[name]['migration_report_path'] = candidates[-1]
     if wb_paths:
@@ -1300,7 +1372,7 @@ def _migrate_single_prep_flow(tableau_file, basename, workbook_output_dir, displ
 
     # Output directory for this flow
     flow_out = os.path.join(workbook_output_dir, basename)
-    os.makedirs(flow_out, exist_ok=True)
+    _lp_makedirs(flow_out, exist_ok=True)
 
     print_step("2", 2, "EXPORT POWER QUERY M & SOURCES")
 
@@ -1308,11 +1380,11 @@ def _migrate_single_prep_flow(tableau_file, basename, workbook_output_dir, displ
     pq_dir = os.path.join(flow_out, 'PowerQuery')
     pq_count = 0
     if profile.m_queries:
-        os.makedirs(pq_dir, exist_ok=True)
+        _lp_makedirs(pq_dir, exist_ok=True)
         for tbl_name, m_code in profile.m_queries.items():
             safe_name = tbl_name.replace('/', '_').replace('\\', '_')
             pq_path = os.path.join(pq_dir, f'{safe_name}.pq')
-            with open(pq_path, 'w', encoding='utf-8') as f:
+            with _lp_open(pq_path, 'w', encoding='utf-8') as f:
                 f.write(m_code)
             pq_count += 1
     if pq_count:
@@ -1322,7 +1394,7 @@ def _migrate_single_prep_flow(tableau_file, basename, workbook_output_dir, displ
     src_dir = os.path.join(flow_out, 'Sources')
     src_count = 0
     if profile.inputs:
-        os.makedirs(src_dir, exist_ok=True)
+        _lp_makedirs(src_dir, exist_ok=True)
         for inp in profile.inputs:
             safe_name = inp.name.replace('/', '_').replace('\\', '_')
             src_path = os.path.join(src_dir, f'{safe_name}.json')
@@ -1339,7 +1411,7 @@ def _migrate_single_prep_flow(tableau_file, basename, workbook_output_dir, displ
                 'fingerprint': inp.fingerprint,
                 'flow': profile.name,
             }
-            with open(src_path, 'w', encoding='utf-8') as f:
+            with _lp_open(src_path, 'w', encoding='utf-8') as f:
                 json.dump(src_data, f, indent=2, ensure_ascii=False)
             src_count += 1
     if src_count:
@@ -1347,7 +1419,7 @@ def _migrate_single_prep_flow(tableau_file, basename, workbook_output_dir, displ
 
     # Export flow assessment summary
     assessment_path = os.path.join(flow_out, 'assessment.json')
-    with open(assessment_path, 'w', encoding='utf-8') as f:
+    with _lp_open(assessment_path, 'w', encoding='utf-8') as f:
         json.dump({
             'flow_name': profile.name,
             'grade': grade,
@@ -1504,7 +1576,7 @@ def _run_batch_prep_lineage(batch_results, migrated_root):
     print_lineage_summary(graph, recommendations)
 
     lineage_dir = os.path.join(migrated_root, 'prep_lineage')
-    os.makedirs(lineage_dir, exist_ok=True)
+    _lp_makedirs(lineage_dir, exist_ok=True)
 
     html_path = os.path.join(lineage_dir, 'prep_lineage_report.html')
     generate_prep_lineage_report(graph, recommendations, html_path)
@@ -1538,7 +1610,7 @@ def _print_batch_summary(batch_results, batch_duration, migrated_root):
                 'metadata_path': res.get('metadata_path'),
             }
             pattern = os.path.join(out, f'migration_report_{name}_*.json')
-            candidates = sorted(glob.glob(pattern))
+            candidates = sorted(_lp_glob(pattern))
             if candidates:
                 wb_paths[name]['migration_report_path'] = candidates[-1]
     if wb_paths:
@@ -1635,12 +1707,12 @@ def _run_full_lineage(batch_results, migrated_root):
             os.path.join(_get_extract_dir(), 'datasources.json'),
             os.path.join(out_dir, wb_name, 'datasources.json'),
         ]:
-            if os.path.isfile(candidate):
+            if _lp_isfile(candidate):
                 ds_path = candidate
                 break
         if ds_path:
             try:
-                with open(ds_path, 'r', encoding='utf-8') as f:
+                with _lp_open(ds_path, 'r', encoding='utf-8') as f:
                     workbook_extractions[wb_name] = json.load(f)
             except (OSError, json.JSONDecodeError) as e:
                 logger.warning(f"Could not load datasources for {wb_name}: {e}")
@@ -1665,9 +1737,9 @@ def _run_full_lineage(batch_results, migrated_root):
 
     # Save JSON report
     lineage_dir = os.path.join(migrated_root, 'full_lineage')
-    os.makedirs(lineage_dir, exist_ok=True)
+    _lp_makedirs(lineage_dir, exist_ok=True)
     json_path = os.path.join(lineage_dir, 'full_lineage.json')
-    with open(json_path, 'w', encoding='utf-8') as f:
+    with _lp_open(json_path, 'w', encoding='utf-8') as f:
         json.dump(lineage.to_dict(), f, indent=2, ensure_ascii=False)
     print(f"  JSON report: {json_path}")
 
@@ -1703,7 +1775,7 @@ def run_batch_migration(batch_dir, output_dir=None, prep_file=None, skip_extract
     Returns:
         int: 0 if all succeeded, 1 if any failed
     """
-    if not os.path.isdir(batch_dir):
+    if not _lp_isdir(batch_dir):
         print(f"Error: Batch directory not found: {batch_dir}")
         return 1
 
@@ -1711,7 +1783,7 @@ def run_batch_migration(batch_dir, output_dir=None, prep_file=None, skip_extract
 
     # Find all Tableau workbooks recursively
     tableau_files = []
-    for root, _dirs, files in os.walk(batch_dir):
+    for root, _dirs, files in _lp_walk(batch_dir):
         for f in files:
             if f.lower().endswith(('.twb', '.twbx', '.tds', '.tdsx', '.tfl', '.tflx')) and not f.startswith('~'):
                 tableau_files.append(os.path.join(root, f))
@@ -1724,7 +1796,7 @@ def run_batch_migration(batch_dir, output_dir=None, prep_file=None, skip_extract
 
     # Output root: honour --output-dir or default to <batch_dir>/migrated
     migrated_root = output_dir if output_dir else os.path.join(batch_dir, 'migrated')
-    os.makedirs(migrated_root, exist_ok=True)
+    _lp_makedirs(migrated_root, exist_ok=True)
 
     print_header("TABLEAU TO POWER BI BATCH MIGRATION")
     print(f"  Source:     {batch_dir}")
@@ -1741,7 +1813,7 @@ def run_batch_migration(batch_dir, output_dir=None, prep_file=None, skip_extract
     # ── JSONL structured logging ──────────────────────────────
     jsonl_fh = None
     if jsonl_log:
-        jsonl_fh = open(jsonl_log, 'a', encoding='utf-8')
+        jsonl_fh = _lp_open(jsonl_log, 'a', encoding='utf-8')
 
     def _write_jsonl(event_type, data):
         """Append a structured event to the JSONL log file."""
@@ -1773,7 +1845,7 @@ def run_batch_migration(batch_dir, output_dir=None, prep_file=None, skip_extract
             rel = os.path.relpath(os.path.dirname(twb), batch_dir)
             out_base = os.path.join(migrated_root, rel) if rel != '.' else migrated_root
             pbip_path = os.path.join(out_base, bn, f'{bn}.pbip')
-            if os.path.exists(pbip_path):
+            if _lp_exists(pbip_path):
                 logger.info("Resume: skipping already-completed %s", bn)
                 _write_jsonl('resume_skip', {'workbook': bn, 'pbip_path': pbip_path})
             else:
@@ -1805,7 +1877,7 @@ def run_batch_migration(batch_dir, output_dir=None, prep_file=None, skip_extract
         basename = os.path.splitext(os.path.basename(tableau_file))[0]
         rel_dir = os.path.relpath(os.path.dirname(tableau_file), batch_dir)
         workbook_output_dir = os.path.join(migrated_root, rel_dir) if rel_dir != '.' else migrated_root
-        os.makedirs(workbook_output_dir, exist_ok=True)
+        _lp_makedirs(workbook_output_dir, exist_ok=True)
         display_name = os.path.join(rel_dir, basename) if rel_dir != '.' else basename
 
         # Per-workbook config from manifest (if provided)
@@ -3244,7 +3316,7 @@ def _handle_enterprise_server_ops(args):
     from tableau_export.server_client import TableauServerClient
 
     output_dir = getattr(args, 'output_dir', None) or 'artifacts/server_migration'
-    os.makedirs(output_dir, exist_ok=True)
+    _lp_makedirs(output_dir, exist_ok=True)
 
     ts_client = TableauServerClient(
         server_url=args.server,
@@ -3278,7 +3350,7 @@ def _handle_enterprise_server_ops(args):
             save_topology(topology, topo_path)
             print(f"  Topology saved to {topo_path}")
 
-            with open(report_path, 'w', encoding='utf-8') as f:
+            with _lp_open(report_path, 'w', encoding='utf-8') as f:
                 f.write(report)
             print(f"  Report:  {report_path}")
 
@@ -3357,7 +3429,7 @@ def _handle_enterprise_server_ops(args):
             report = generate_subscription_report(
                 subscriptions, alerts, pbi_subs, flows, conflicts, report_path,
             )
-            with open(report_path, 'w', encoding='utf-8') as f:
+            with _lp_open(report_path, 'w', encoding='utf-8') as f:
                 f.write(report)
             print(f"  Report: {report_path}")
 
@@ -3386,7 +3458,7 @@ def _handle_enterprise_server_ops(args):
                 )
                 dashboard = generate_cutover_dashboard(cutover_plan, result)
                 dash_path = os.path.join(output_dir, 'cutover_dashboard.html')
-                with open(dash_path, 'w', encoding='utf-8') as f:
+                with _lp_open(dash_path, 'w', encoding='utf-8') as f:
                     f.write(dashboard)
                 print(f"  Dashboard: {dash_path}")
 
@@ -3455,12 +3527,12 @@ def _download_from_server(args):
                         for wb in workbooks_meta
                     }
                     for r in dl_results:
-                        if r['status'] == 'success' and os.path.isfile(r['path']):
+                        if r['status'] == 'success' and _lp_isfile(r['path']):
                             proj_name = project_map.get(r['name'], '')
                             if proj_name:
                                 safe_proj = _re_srv.sub(r'[^\w\-. ]', '_', proj_name)
                                 dest_dir = os.path.join(download_dir, safe_proj)
-                                os.makedirs(dest_dir, exist_ok=True)
+                                _lp_makedirs(dest_dir, exist_ok=True)
                                 dest = os.path.join(dest_dir, os.path.basename(r['path']))
                                 if r['path'] != dest:
                                     os.replace(r['path'], dest)
@@ -3495,7 +3567,7 @@ def _download_from_server(args):
                         else:
                             fl_dir = download_dir
 
-                        os.makedirs(fl_dir, exist_ok=True)
+                        _lp_makedirs(fl_dir, exist_ok=True)
                         fl_path = os.path.join(fl_dir, f'{safe}.tflx')
                         try:
                             ts_client.download_prep_flow(fl['id'], fl_path)
@@ -3532,7 +3604,7 @@ def _download_from_server(args):
                         else:
                             ds_dir = download_dir
 
-                        os.makedirs(ds_dir, exist_ok=True)
+                        _lp_makedirs(ds_dir, exist_ok=True)
                         ds_path = os.path.join(ds_dir, f'{safe}.tdsx')
                         try:
                             ts_client.download_datasource(ds['id'], ds_path)
@@ -3601,7 +3673,7 @@ def _download_from_server(args):
             import re as _re
             safe_name = _re.sub(r'[^\w\-.]', '_', match.get('name', 'workbook'))
             twbx_path = os.path.join(download_dir, f'{safe_name}.twbx')
-            os.makedirs(download_dir, exist_ok=True)
+            _lp_makedirs(download_dir, exist_ok=True)
             ts_client.download_workbook(match['id'], twbx_path)
             ts_client.sign_out()
             print(f"  Downloaded: {twbx_path}")
@@ -3847,12 +3919,12 @@ def run_prep_lineage_mode(args):
     # Expand directories and collect files
     flow_files = []
     for p in paths:
-        if os.path.isdir(p):
-            for root, _dirs, files in os.walk(p):
+        if _lp_isdir(p):
+            for root, _dirs, files in _lp_walk(p):
                 for fname in sorted(files):
                     if fname.lower().endswith(('.tfl', '.tflx')):
                         flow_files.append(os.path.join(root, fname))
-        elif os.path.isfile(p) and p.lower().endswith(('.tfl', '.tflx')):
+        elif _lp_isfile(p) and p.lower().endswith(('.tfl', '.tflx')):
             flow_files.append(p)
         else:
             print(f'Warning: Skipping non-TFL path: {p}')
@@ -3899,7 +3971,7 @@ def run_prep_lineage_mode(args):
     out = getattr(args, 'output_dir', None) or os.path.join(
         'artifacts', 'powerbi_projects', 'prep_lineage'
     )
-    os.makedirs(out, exist_ok=True)
+    _lp_makedirs(out, exist_ok=True)
 
     html_path = os.path.join(out, 'prep_lineage_report.html')
     generate_prep_lineage_report(graph, recommendations, html_path)
@@ -3916,7 +3988,7 @@ def run_prep_lineage_mode(args):
         if not profile.inputs:
             continue
         flow_src_dir = os.path.join(src_dir, profile.name)
-        os.makedirs(flow_src_dir, exist_ok=True)
+        _lp_makedirs(flow_src_dir, exist_ok=True)
         for inp in profile.inputs:
             safe_name = inp.name.replace('/', '_').replace('\\', '_')
             src_path = os.path.join(flow_src_dir, f'{safe_name}.json')
@@ -3933,7 +4005,7 @@ def run_prep_lineage_mode(args):
                 'fingerprint': inp.fingerprint,
                 'flow': profile.name,
             }
-            with open(src_path, 'w', encoding='utf-8') as f:
+            with _lp_open(src_path, 'w', encoding='utf-8') as f:
                 json.dump(src_data, f, indent=2, ensure_ascii=False)
             src_count += 1
     if src_count:
@@ -3945,10 +4017,10 @@ def run_prep_lineage_mode(args):
     for profile in profiles:
         if profile.m_queries:
             flow_pq_dir = os.path.join(pq_dir, profile.name)
-            os.makedirs(flow_pq_dir, exist_ok=True)
+            _lp_makedirs(flow_pq_dir, exist_ok=True)
             for tbl_name, m_code in profile.m_queries.items():
                 pq_path = os.path.join(flow_pq_dir, f'{tbl_name}.pq')
-                with open(pq_path, 'w', encoding='utf-8') as f:
+                with _lp_open(pq_path, 'w', encoding='utf-8') as f:
                     f.write(m_code)
                 pq_count += 1
     if pq_count:
@@ -3976,7 +4048,7 @@ def run_bulk_assessment_mode(args):
     import shutil
 
     batch_dir = args.bulk_assess
-    if not os.path.isdir(batch_dir):
+    if not _lp_isdir(batch_dir):
         print(f"Error: Directory not found: {batch_dir}")
         return ExitCode.GENERAL_ERROR
 
@@ -3985,7 +4057,7 @@ def run_bulk_assessment_mode(args):
     # Discover workbooks and prep flows
     workbook_files = []
     prep_flow_files = []
-    for root, _dirs, files in os.walk(batch_dir):
+    for root, _dirs, files in _lp_walk(batch_dir):
         for f in files:
             lower = f.lower()
             if f.startswith('~'):
@@ -4090,7 +4162,7 @@ def run_bulk_assessment_mode(args):
         out = args.output_dir or os.path.join(
             'artifacts', 'powerbi_projects', 'assessments'
         )
-        os.makedirs(out, exist_ok=True)
+        _lp_makedirs(out, exist_ok=True)
 
         # ── 3a: Portfolio readiness (per-workbook) ─────────────
         server_result = None
@@ -4156,7 +4228,7 @@ def run_bulk_assessment_mode(args):
                 recommendations = compute_merge_recommendations(graph, prep_profiles)
 
                 lineage_dir = os.path.join(out, 'prep_lineage')
-                os.makedirs(lineage_dir, exist_ok=True)
+                _lp_makedirs(lineage_dir, exist_ok=True)
 
                 html_path = os.path.join(lineage_dir, 'prep_lineage_report.html')
                 generate_prep_lineage_report(graph, recommendations, html_path)
@@ -4220,7 +4292,7 @@ def run_global_assessment_mode(args):
         import glob
         for ext in ('*.twb', '*.twbx'):
             workbook_paths.extend(
-                glob.glob(os.path.join(args.batch, '**', ext), recursive=True)
+                _lp_glob(os.path.join(args.batch, '**', ext), recursive=True)
             )
         workbook_paths.sort()
 
@@ -4231,7 +4303,7 @@ def run_global_assessment_mode(args):
 
     # Validate all files exist
     for wb_path in workbook_paths:
-        if not os.path.exists(wb_path):
+        if not _lp_exists(wb_path):
             print(f"Error: Workbook not found: {wb_path}")
             return ExitCode.GENERAL_ERROR
 
@@ -4294,7 +4366,7 @@ def run_global_assessment_mode(args):
         out = args.output_dir or os.path.join(
             'artifacts', 'powerbi_projects', 'assessments'
         )
-        os.makedirs(out, exist_ok=True)
+        _lp_makedirs(out, exist_ok=True)
 
         html_path = os.path.join(out, 'global_assessment.html')
         generate_global_html_report(result, output_path=html_path)
@@ -4449,7 +4521,7 @@ def run_shared_model_migration(workbook_paths, model_name=None, output_dir=None,
 
     # Validate all files exist
     for wb_path in workbook_paths:
-        if not os.path.exists(wb_path):
+        if not _lp_exists(wb_path):
             print(f"Error: Workbook not found: {wb_path}")
             return ExitCode.GENERAL_ERROR
 
@@ -4508,7 +4580,7 @@ def run_shared_model_migration(workbook_paths, model_name=None, output_dir=None,
 
             # Save assessment JSON
             out = output_dir or os.path.join('artifacts', 'powerbi_projects', 'assessments')
-            os.makedirs(out, exist_ok=True)
+            _lp_makedirs(out, exist_ok=True)
             assess_path = os.path.join(out, f'merge_assessment_{model_name}.json')
             generate_merge_report(assessment, output_path=assess_path)
             print(f"  Assessment saved: {assess_path}")
@@ -4576,10 +4648,10 @@ def _run_add_to_model(args):
     import shutil
 
     model_dir, workbook_path = args.add_to_model
-    if not os.path.isdir(model_dir):
+    if not _lp_isdir(model_dir):
         print(f"Error: Model directory not found: {model_dir}")
         return ExitCode.GENERAL_ERROR
-    if not os.path.exists(workbook_path):
+    if not _lp_exists(workbook_path):
         print(f"Error: Workbook not found: {workbook_path}")
         return ExitCode.GENERAL_ERROR
 
@@ -4633,7 +4705,7 @@ def _run_add_to_model(args):
             gen = PowerBIProjectGenerator()
             project_dir = model_dir
             sm_dir = None
-            for entry in os.listdir(model_dir):
+            for entry in _lp_listdir(model_dir):
                 if entry.endswith('.SemanticModel'):
                     sm_dir = os.path.join(model_dir, entry)
                     break
@@ -4677,7 +4749,7 @@ def _run_add_to_model(args):
 def _run_remove_from_model(args):
     """Handle --remove-from-model DIR WB_NAME."""
     model_dir, wb_name = args.remove_from_model
-    if not os.path.isdir(model_dir):
+    if not _lp_isdir(model_dir):
         print(f"Error: Model directory not found: {model_dir}")
         return ExitCode.GENERAL_ERROR
 
@@ -4721,7 +4793,7 @@ def _run_remove_from_model(args):
                 from pbip_generator import PowerBIProjectGenerator
                 gen = PowerBIProjectGenerator()
                 sm_dir = None
-                for entry in os.listdir(model_dir):
+                for entry in _lp_listdir(model_dir):
                     if entry.endswith('.SemanticModel'):
                         sm_dir = os.path.join(model_dir, entry)
                         break
@@ -4731,10 +4803,10 @@ def _run_remove_from_model(args):
                     )
 
             # Remove the thin report directory
-            for entry in os.listdir(model_dir):
+            for entry in _lp_listdir(model_dir):
                 if entry.startswith(wb_name) and entry.endswith('.Report'):
                     report_dir = os.path.join(model_dir, entry)
-                    if os.path.isdir(report_dir):
+                    if _lp_isdir(report_dir):
                         import shutil
                         shutil.rmtree(report_dir, ignore_errors=True)
                         print(f"  Removed thin report: {entry}")
@@ -4769,9 +4841,9 @@ def _run_parity_mode(args):
                       'sort_orders', 'aliases', 'data_blending', 'hyper_files']
         for jf in json_files:
             fpath = os.path.join(_get_extract_dir(), f'{jf}.json')
-            if os.path.exists(fpath):
+            if _lp_exists(fpath):
                 try:
-                    with open(fpath, 'r', encoding='utf-8') as f:
+                    with _lp_open(fpath, 'r', encoding='utf-8') as f:
                         extracted[jf] = json.load(f)
                 except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                     extracted[jf] = []
@@ -4788,7 +4860,7 @@ def _run_parity_mode(args):
             print(f"    - [{u.status}] {u.label} ×{u.count} → {u.target}")
 
         out_dir = args.output_dir or os.path.join('artifacts', 'powerbi_projects', 'assessments')
-        os.makedirs(out_dir, exist_ok=True)
+        _lp_makedirs(out_dir, exist_ok=True)
         json_path = os.path.join(out_dir, f'parity_scorecard_{source_basename}.json')
         html_path = os.path.join(out_dir, f'parity_scorecard_{source_basename}.html')
         scan.save_json(json_path)
@@ -4824,8 +4896,8 @@ def _run_assessment_mode(args, results):
                       'sort_orders', 'aliases']
         for jf in json_files:
             fpath = os.path.join(_get_extract_dir(), f'{jf}.json')
-            if os.path.exists(fpath):
-                with open(fpath, 'r', encoding='utf-8') as f:
+            if _lp_exists(fpath):
+                with _lp_open(fpath, 'r', encoding='utf-8') as f:
                     extracted[jf] = json.load(f)
 
         # Run assessment
@@ -4834,7 +4906,7 @@ def _run_assessment_mode(args, results):
 
         # Save assessment report
         out_dir = args.output_dir or os.path.join('artifacts', 'powerbi_projects', 'assessments')
-        os.makedirs(out_dir, exist_ok=True)
+        _lp_makedirs(out_dir, exist_ok=True)
         source_basename = os.path.splitext(os.path.basename(args.tableau_file))[0]
         assess_path = os.path.join(out_dir, f'assessment_{source_basename}.json')
         save_assessment_report(report, assess_path)
@@ -5002,7 +5074,7 @@ def _run_assessment_mode(args, results):
             )
 
             # Also place a copy next to the saved assessment report bundle folder.
-            if os.path.isdir(assess_path):
+            if _lp_isdir(assess_path):
                 nested_summary_csv_path = os.path.join(
                     assess_path,
                     f'MIGRATION_DASHBOARD_{source_basename}_summary.csv',
@@ -5157,7 +5229,7 @@ def main():
             import glob
             for ext in ('*.twb', '*.twbx'):
                 workbook_paths.extend(
-                    glob.glob(os.path.join(args.batch, '**', ext), recursive=True)
+                    _lp_glob(os.path.join(args.batch, '**', ext), recursive=True)
                 )
             workbook_paths.sort()
 
@@ -5201,7 +5273,7 @@ def main():
         if not project_dir:
             print("Error: --deploy-bundle requires --output-dir pointing to a project directory")
             return ExitCode.GENERAL_ERROR
-        if not os.path.isdir(project_dir):
+        if not _lp_isdir(project_dir):
             print(f"Error: project directory not found: {project_dir}")
             return ExitCode.GENERAL_ERROR
         return _run_bundle_deploy(
@@ -5213,7 +5285,7 @@ def main():
     manifest_data = None
     if getattr(args, 'manifest', None):
         try:
-            with open(args.manifest, 'r', encoding='utf-8') as mf:
+            with _lp_open(args.manifest, 'r', encoding='utf-8') as mf:
                 manifest_data = json.loads(mf.read())
         except (OSError, json.JSONDecodeError) as exc:
             print(f"Error: Cannot load manifest {args.manifest}: {exc}")
@@ -5313,7 +5385,7 @@ def _run_incremental_merge(args, source_basename):
         out_dir = args.output_dir or os.path.join('artifacts', 'powerbi_projects', 'migrated')
         generated_dir = os.path.join(out_dir, source_basename)
         existing_dir = args.incremental
-        if os.path.isdir(existing_dir) and os.path.isdir(generated_dir):
+        if _lp_isdir(existing_dir) and _lp_isdir(generated_dir):
             print_header("INCREMENTAL MERGE")
             merge_stats = IncrementalMerger.merge(
                 existing_dir=existing_dir,
@@ -5345,7 +5417,7 @@ def _run_goals_generation(args, source_basename):
 
         twb_path = args.tableau_file
         pulse_root = None
-        if twb_path and os.path.isfile(twb_path):
+        if twb_path and _lp_isfile(twb_path):
             if twb_path.endswith('.twbx'):
                 import zipfile
                 with zipfile.ZipFile(twb_path, 'r') as z:
@@ -5387,8 +5459,8 @@ def _run_governance_checks(args, source_basename):
         gov_config = {"mode": args.governance}
         if getattr(args, 'governance_config', None):
             config_path = args.governance_config
-            if os.path.isfile(config_path):
-                with open(config_path, 'r', encoding='utf-8') as f:
+            if _lp_isfile(config_path):
+                with _lp_open(config_path, 'r', encoding='utf-8') as f:
                     user_cfg = json.load(f)
                 if isinstance(user_cfg, dict):
                     gov_config.update(user_cfg)
@@ -5397,8 +5469,8 @@ def _run_governance_checks(args, source_basename):
         source_dir = _get_extract_dir()
         tmdl_tables = []
         ds_path = os.path.join(source_dir, 'datasources.json')
-        if os.path.isfile(ds_path):
-            with open(ds_path, 'r', encoding='utf-8') as f:
+        if _lp_isfile(ds_path):
+            with _lp_open(ds_path, 'r', encoding='utf-8') as f:
                 datasources = json.load(f)
             for ds in datasources:
                 for table in ds.get('tables', []):
@@ -5408,8 +5480,8 @@ def _run_governance_checks(args, source_basename):
                         'measures': [],
                     })
         calc_path = os.path.join(source_dir, 'calculations.json')
-        if os.path.isfile(calc_path):
-            with open(calc_path, 'r', encoding='utf-8') as f:
+        if _lp_isfile(calc_path):
+            with _lp_open(calc_path, 'r', encoding='utf-8') as f:
                 calcs = json.load(f)
             # Add measures to the first table (main table)
             if tmdl_tables:
@@ -5435,9 +5507,9 @@ def _run_governance_checks(args, source_basename):
         # Save governance report JSON alongside the project
         out_dir = args.output_dir or os.path.join('artifacts', 'powerbi_projects', 'migrated')
         project_dir = os.path.join(out_dir, source_basename)
-        if os.path.isdir(project_dir):
+        if _lp_isdir(project_dir):
             gov_path = os.path.join(project_dir, 'governance_report.json')
-            with open(gov_path, 'w', encoding='utf-8') as f:
+            with _lp_open(gov_path, 'w', encoding='utf-8') as f:
                 json.dump(report.to_dict(), f, indent=2, ensure_ascii=False)
             print(f"  ✓ Governance report: {gov_path}")
 
@@ -5445,11 +5517,11 @@ def _run_governance_checks(args, source_basename):
         if gov_config.get('audit_trail', True):
             audit_log_path = gov_config.get('audit_log_path', 'migration_audit.jsonl')
             # If relative, place alongside the project
-            if not os.path.isabs(audit_log_path) and os.path.isdir(project_dir):
+            if not os.path.isabs(audit_log_path) and _lp_isdir(project_dir):
                 audit_log_path = os.path.join(project_dir, audit_log_path)
             audit = AuditTrail(log_path=audit_log_path)
             source_hash = AuditTrail.compute_file_hash(getattr(args, 'tableau_file', ''))
-            output_hash = AuditTrail.compute_dir_hash(project_dir) if os.path.isdir(project_dir) else ""
+            output_hash = AuditTrail.compute_dir_hash(project_dir) if _lp_isdir(project_dir) else ""
             audit.record(
                 source_file=getattr(args, 'tableau_file', ''),
                 output_dir=project_dir,
@@ -5490,7 +5562,7 @@ def _run_rollback_gate(args, source_basename):
 
     out_base = args.output_dir or os.path.join('artifacts', 'powerbi_projects', 'migrated')
     project_dir = os.path.join(out_base, source_basename)
-    if not os.path.isdir(project_dir):
+    if not _lp_isdir(project_dir):
         return None
 
     extract_dir = _get_extract_dir()
@@ -5504,9 +5576,9 @@ def _run_rollback_gate(args, source_basename):
     try:
         from powerbi_import.schema_validator import validate_report_dir
         report_def_dir = None
-        for entry in os.listdir(project_dir):
+        for entry in _lp_listdir(project_dir):
             candidate = os.path.join(project_dir, entry, 'definition')
-            if entry.endswith('.Report') and os.path.isdir(candidate):
+            if entry.endswith('.Report') and _lp_isdir(candidate):
                 report_def_dir = candidate
                 break
         if report_def_dir:
@@ -5519,8 +5591,8 @@ def _run_rollback_gate(args, source_basename):
     try:
         from powerbi_import.cross_validator import cross_validate
         model_bim = os.path.join(project_dir, 'model.bim')
-        if os.path.isfile(model_bim):
-            with open(model_bim, 'r', encoding='utf-8') as f:
+        if _lp_isfile(model_bim):
+            with _lp_open(model_bim, 'r', encoding='utf-8') as f:
                 model = json.load(f)
             # Build report state from definition dir
             report_state = {}
@@ -5534,8 +5606,8 @@ def _run_rollback_gate(args, source_basename):
     # Ingest recovery report if available
     try:
         recovery_json = os.path.join(project_dir, f'{source_basename}_recovery.json')
-        if os.path.isfile(recovery_json):
-            with open(recovery_json, 'r', encoding='utf-8') as f:
+        if _lp_isfile(recovery_json):
+            with _lp_open(recovery_json, 'r', encoding='utf-8') as f:
                 recovery_data = json.load(f)
             engine.ingest_repairs(recovery_data)
     except (OSError, json.JSONDecodeError):
@@ -5547,7 +5619,7 @@ def _run_rollback_gate(args, source_basename):
     # Determine backup dir for potential rollback
     backup_dir = None
     if args.rollback:
-        for entry in os.listdir(out_base):
+        for entry in _lp_listdir(out_base):
             if entry.startswith(source_basename + '.backup_'):
                 backup_dir = os.path.join(out_base, entry)
 
@@ -5625,7 +5697,7 @@ def _record_zero_touch(args, source_basename, *, success, failure_mode='',
     dashboard_path = os.path.join(
         os.path.dirname(__file__), 'docs', 'zero_error_dashboard.html'
     )
-    if tracker.total_count >= 3 or os.path.isfile(dashboard_path):
+    if tracker.total_count >= 3 or _lp_isfile(dashboard_path):
         tracker.save_dashboard(dashboard_path)
 
 
@@ -5633,7 +5705,7 @@ def _run_autoheal(args, source_basename):
     """Closed-loop autoheal so the generated .pbip opens cleanly in PBI Desktop."""
     out_base = args.output_dir or os.path.join('artifacts', 'powerbi_projects', 'migrated')
     project_dir = os.path.join(out_base, source_basename)
-    if not os.path.isdir(project_dir):
+    if not _lp_isdir(project_dir):
         print(f"  ⚠ Autoheal skipped: project directory not found")
         return
     try:
@@ -5661,7 +5733,7 @@ def _run_autoheal(args, source_basename):
 
     log_path = getattr(args, 'autoheal_log', None)
     source = None
-    if log_path and os.path.isfile(log_path):
+    if log_path and _lp_isfile(log_path):
         source = LogFileSource(log_path)
 
     healer = AutoHealer(gateway=gateway, autofix=autofix, error_source=source)
@@ -5675,7 +5747,7 @@ def _run_autoheal(args, source_basename):
     for err in report.remaining_errors[:10]:
         print(f"      ✗ [{err.artifact}] {err.location}: {err.message}")
     try:
-        with open(os.path.join(project_dir, 'autoheal_report.json'), 'w',
+        with _lp_open(os.path.join(project_dir, 'autoheal_report.json'), 'w',
                   encoding='utf-8') as f:
             json.dump(report.to_dict(), f, indent=2)
     except OSError:
@@ -5686,7 +5758,7 @@ def _run_desktop_probe(args, source_basename):
     """Best-effort real Power BI Desktop open self-check on the generated .pbip."""
     out_base = args.output_dir or os.path.join('artifacts', 'powerbi_projects', 'migrated')
     project_dir = os.path.join(out_base, source_basename)
-    if not os.path.isdir(project_dir):
+    if not _lp_isdir(project_dir):
         print(f"  ⚠ Desktop probe skipped: project directory not found")
         return
     import glob as _glob
@@ -5706,7 +5778,7 @@ def _run_desktop_probe(args, source_basename):
     for sig in report.signals[:10]:
         print(f"      • {sig}")
     try:
-        with open(os.path.join(project_dir, 'desktop_probe_report.json'), 'w',
+        with _lp_open(os.path.join(project_dir, 'desktop_probe_report.json'), 'w',
                   encoding='utf-8') as f:
             json.dump(report.to_dict(), f, indent=2)
     except OSError:
@@ -5715,7 +5787,7 @@ def _run_desktop_probe(args, source_basename):
 
 def _run_openability_gate(project_dir):
     """Run and persist the static Power BI openability gate for a project directory."""
-    if not os.path.isdir(project_dir):
+    if not _lp_isdir(project_dir):
         print(f"  ⚠ Openability preflight skipped: project directory not found")
         return True
     try:
@@ -5734,7 +5806,7 @@ def _run_openability_gate(project_dir):
             print(f"      • {issue}")
     try:
         report_path = os.path.join(project_dir, 'openability_report.json')
-        with open(report_path, 'w', encoding='utf-8') as f:
+        with _lp_open(report_path, 'w', encoding='utf-8') as f:
             json.dump(report.to_dict(), f, indent=2)
     except OSError:
         pass
@@ -5753,7 +5825,7 @@ def _run_qa_suite(args, source_basename):
     out_base = args.output_dir or os.path.join('artifacts', 'powerbi_projects', 'migrated')
     project_dir = os.path.join(out_base, source_basename)
 
-    if not os.path.isdir(project_dir):
+    if not _lp_isdir(project_dir):
         print(f"  ⚠ QA suite skipped: project directory not found")
         return
 
@@ -5806,8 +5878,8 @@ def _run_qa_suite(args, source_basename):
             source_dir = _get_extract_dir()
             tmdl_tables = []
             ds_path = os.path.join(source_dir, 'datasources.json')
-            if os.path.isfile(ds_path):
-                with open(ds_path, 'r', encoding='utf-8') as f:
+            if _lp_isfile(ds_path):
+                with _lp_open(ds_path, 'r', encoding='utf-8') as f:
                     datasources = json.load(f)
                 for ds in datasources:
                     for table in ds.get('tables', []):
@@ -5844,7 +5916,7 @@ def _run_qa_suite(args, source_basename):
     # 5. Write QA report JSON
     qa_path = os.path.join(project_dir, 'qa_report.json')
     try:
-        with open(qa_path, 'w', encoding='utf-8') as f:
+        with _lp_open(qa_path, 'w', encoding='utf-8') as f:
             json.dump(qa_results, f, indent=2, ensure_ascii=False, default=str)
         print(f"  QA Report: ✓ {qa_path}")
     except OSError as exc:
@@ -5857,7 +5929,7 @@ def _run_qa_suite(args, source_basename):
         extract_dir = _get_extract_dir()
         rw_report = run_qa_suite(
             project_dir,
-            extraction_dir=extract_dir if os.path.isdir(extract_dir) else None,
+            extraction_dir=extract_dir if _lp_isdir(extract_dir) else None,
             workbook=source_basename,
         )
         html_path = os.path.join(project_dir, 'qa_report.html')
@@ -5890,7 +5962,7 @@ def _export_power_query_files(project_dir, source_basename):
         'definition',
         'tables',
     )
-    if not os.path.isdir(tables_dir):
+    if not _lp_isdir(tables_dir):
         return
 
     pq_dir = os.path.join(project_dir, 'PowerQuery')
@@ -5900,9 +5972,9 @@ def _export_power_query_files(project_dir, source_basename):
         table_name = os.path.splitext(os.path.basename(tmdl_path))[0]
         m_expr = _extract_m_from_tmdl(tmdl_path)
         if m_expr:
-            os.makedirs(pq_dir, exist_ok=True)
+            _lp_makedirs(pq_dir, exist_ok=True)
             pq_path = os.path.join(pq_dir, f'{table_name}.pq')
-            with open(pq_path, 'w', encoding='utf-8') as f:
+            with _lp_open(pq_path, 'w', encoding='utf-8') as f:
                 f.write(m_expr)
             exported += 1
 
@@ -5913,13 +5985,13 @@ def _export_power_query_files(project_dir, source_basename):
         'definition',
         'expressions.tmdl',
     )
-    if os.path.isfile(expr_path):
+    if _lp_isfile(expr_path):
         try:
-            with open(expr_path, 'r', encoding='utf-8') as f:
+            with _lp_open(expr_path, 'r', encoding='utf-8') as f:
                 content = f.read().strip()
             if content:
-                os.makedirs(pq_dir, exist_ok=True)
-                with open(os.path.join(pq_dir, '_expressions.pq'), 'w', encoding='utf-8') as f:
+                _lp_makedirs(pq_dir, exist_ok=True)
+                with _lp_open(os.path.join(pq_dir, '_expressions.pq'), 'w', encoding='utf-8') as f:
                     f.write(content)
                 exported += 1
         except OSError:
@@ -5934,7 +6006,7 @@ def _extract_m_from_tmdl(tmdl_path):
     import re as _re
 
     try:
-        with open(tmdl_path, 'r', encoding='utf-8') as f:
+        with _lp_open(tmdl_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
     except OSError:
         return None
@@ -6010,7 +6082,7 @@ def _export_dax_files(project_dir, source_basename):
         'definition',
         'tables',
     )
-    if not os.path.isdir(tables_dir):
+    if not _lp_isdir(tables_dir):
         return
 
     dax_dir = os.path.join(project_dir, 'DAX')
@@ -6020,9 +6092,9 @@ def _export_dax_files(project_dir, source_basename):
         table_name = os.path.splitext(os.path.basename(tmdl_path))[0]
         measures = _extract_dax_from_tmdl(tmdl_path)
         if measures:
-            os.makedirs(dax_dir, exist_ok=True)
+            _lp_makedirs(dax_dir, exist_ok=True)
             dax_path = os.path.join(dax_dir, f'{table_name}.dax')
-            with open(dax_path, 'w', encoding='utf-8') as f:
+            with _lp_open(dax_path, 'w', encoding='utf-8') as f:
                 f.write(f'// DAX measures for table: {table_name}\n')
                 f.write(f'// Auto-generated by Tableau → Power BI migration\n\n')
                 for mname, mexpr in measures:
@@ -6038,7 +6110,7 @@ def _extract_dax_from_tmdl(tmdl_path):
     import re as _re
 
     try:
-        with open(tmdl_path, 'r', encoding='utf-8') as f:
+        with _lp_open(tmdl_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
     except OSError:
         return []
@@ -6105,7 +6177,7 @@ def _convert_hyper_to_csv_in_data(data_dir, source_basename, project_dir):
     import glob as _glob
 
     hyper_files = []
-    for root, _dirs, files in os.walk(data_dir):
+    for root, _dirs, files in _lp_walk(data_dir):
         for fname in files:
             if fname.lower().endswith('.hyper'):
                 hyper_files.append(os.path.join(root, fname))
@@ -6114,7 +6186,7 @@ def _convert_hyper_to_csv_in_data(data_dir, source_basename, project_dir):
 
     # Check if real data files (xlsx/xls) already exist — if so, no conversion needed
     has_xlsx = False
-    for root, _dirs, files in os.walk(data_dir):
+    for root, _dirs, files in _lp_walk(data_dir):
         for fname in files:
             ext = os.path.splitext(fname)[1].lower()
             if ext in {'.xlsx', '.xls'}:
@@ -6127,7 +6199,7 @@ def _convert_hyper_to_csv_in_data(data_dir, source_basename, project_dir):
 
     # Check if CSV files already exist (from a previous hyper conversion)
     existing_csvs = {}
-    for root, _dirs, files in os.walk(data_dir):
+    for root, _dirs, files in _lp_walk(data_dir):
         for fname in files:
             if fname.lower().endswith('.csv'):
                 name = os.path.splitext(fname)[0]
@@ -6154,7 +6226,7 @@ def _convert_hyper_to_csv_in_data(data_dir, source_basename, project_dir):
         'definition',
         'tables',
     )
-    if not os.path.isdir(tables_dir):
+    if not _lp_isdir(tables_dir):
         return
 
     import re as _re
@@ -6170,7 +6242,7 @@ def _convert_hyper_to_csv_in_data(data_dir, source_basename, project_dir):
         os.path.dirname(os.path.abspath(__file__)), 'tableau_export', 'datasources.json'
     )
     try:
-        with open(_ds_json_path, 'r', encoding='utf-8') as f:
+        with _lp_open(_ds_json_path, 'r', encoding='utf-8') as f:
             _ds_data = json.load(f)
         for ds in _ds_data:
             for tbl in ds.get('tables', []):
@@ -6191,7 +6263,7 @@ def _convert_hyper_to_csv_in_data(data_dir, source_basename, project_dir):
 
     for tmdl_path in _glob.glob(os.path.join(tables_dir, '*.tmdl')):
         try:
-            with open(tmdl_path, 'r', encoding='utf-8') as f:
+            with _lp_open(tmdl_path, 'r', encoding='utf-8') as f:
                 content = f.read()
         except OSError:
             continue
@@ -6251,7 +6323,7 @@ def _convert_hyper_to_csv_in_data(data_dir, source_basename, project_dir):
                 csv_headers = []
                 csv_rows = []
                 try:
-                    with open(csv_path, 'r', newline='', encoding='utf-8') as cf:
+                    with _lp_open(csv_path, 'r', newline='', encoding='utf-8') as cf:
                         reader = _csv.reader(cf)
                         csv_headers = next(reader, [])
                         csv_rows = list(reader)
@@ -6292,7 +6364,7 @@ def _convert_hyper_to_csv_in_data(data_dir, source_basename, project_dir):
                             col_idx[mapped] = i
 
                     try:
-                        with open(table_csv_path, 'w', newline='',
+                        with _lp_open(table_csv_path, 'w', newline='',
                                   encoding='utf-8') as wf:
                             writer = _csv.writer(wf)
                             writer.writerow(tmdl_cols)
@@ -6329,7 +6401,7 @@ def _convert_hyper_to_csv_in_data(data_dir, source_basename, project_dir):
 
         if content != original:
             try:
-                with open(tmdl_path, 'w', encoding='utf-8') as f:
+                with _lp_open(tmdl_path, 'w', encoding='utf-8') as f:
                     f.write(content)
             except OSError:
                 pass
@@ -6353,7 +6425,7 @@ def _hyper_to_csv_files(hyper_path, out_dir, prefix, _csv):
                         rows = conn.execute_list_query(f"SELECT * FROM {table}")
                         csv_name = f"{table.name.unescaped}.csv"
                         csv_path = os.path.join(out_dir, csv_name)
-                        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+                        with _lp_open(csv_path, 'w', newline='', encoding='utf-8') as f:
                             writer = _csv.writer(f)
                             writer.writerow(col_names)
                             writer.writerows(rows)
@@ -6387,7 +6459,7 @@ def _hyper_to_csv_files(hyper_path, out_dir, prefix, _csv):
             if rows:
                 csv_name = f"{tname}.csv"
                 csv_path = os.path.join(out_dir, csv_name)
-                with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+                with _lp_open(csv_path, 'w', newline='', encoding='utf-8') as f:
                     writer = _csv.writer(f)
                     writer.writerow(col_names)
                     writer.writerows(rows)
@@ -6430,11 +6502,11 @@ def _fix_twb_data_folder(project_dir, source_basename):
         'definition',
         'expressions.tmdl',
     )
-    if not os.path.isfile(expr_path):
+    if not _lp_isfile(expr_path):
         return
 
     try:
-        with open(expr_path, 'r', encoding='utf-8') as f:
+        with _lp_open(expr_path, 'r', encoding='utf-8') as f:
             content = f.read()
     except OSError:
         return
@@ -6445,12 +6517,12 @@ def _fix_twb_data_folder(project_dir, source_basename):
     current_folder = match.group(1)
 
     # If the current DataFolder already exists on disk, keep it
-    if os.path.isdir(current_folder):
+    if _lp_isdir(current_folder):
         return
 
     # Create a local Data/ folder and point DataFolder there
     data_dir = os.path.join(project_dir, 'Data')
-    os.makedirs(data_dir, exist_ok=True)
+    _lp_makedirs(data_dir, exist_ok=True)
     abs_data = os.path.abspath(data_dir).replace('\\', '\\\\')
     new_content = _re.sub(
         r'(expression\s+DataFolder\s*=\s*)"[^"]*"',
@@ -6458,7 +6530,7 @@ def _fix_twb_data_folder(project_dir, source_basename):
         content,
     )
     if new_content != content:
-        with open(expr_path, 'w', encoding='utf-8') as f:
+        with _lp_open(expr_path, 'w', encoding='utf-8') as f:
             f.write(new_content)
         print(f"  📂 DataFolder updated → {abs_data}")
         print(f"  ℹ️  Place your data files in: {abs_data}")
@@ -6495,8 +6567,8 @@ def _process_twbx_post_generation(source_path, project_dir, source_basename):
                 if ext in _SKIP_EXT or entry.endswith('/'):
                     continue
                 dest = os.path.join(project_dir, entry)
-                os.makedirs(os.path.dirname(dest), exist_ok=True)
-                with zf.open(entry) as src, open(dest, 'wb') as dst:
+                _lp_makedirs(os.path.dirname(dest), exist_ok=True)
+                with zf.open(entry) as src, _lp_open(dest, 'wb') as dst:
                     dst.write(src.read())
                 extracted_files.append(entry)
     except (zipfile.BadZipFile, OSError) as exc:
@@ -6512,14 +6584,14 @@ def _process_twbx_post_generation(source_path, project_dir, source_basename):
     _convert_hyper_to_csv_in_data(data_dir, source_basename, project_dir)
 
     # ── 1c. Canonicalise file tables for Fabric Notebook ingestion ──
-    if os.path.isdir(os.path.join(project_dir, f'{source_basename}.Notebook')):
+    if _lp_isdir(os.path.join(project_dir, f'{source_basename}.Notebook')):
         try:
             from powerbi_import.fabric_file_staging import (
                 stage_fabric_file_sources,
             )
             datasources_path = os.path.join(
                 _get_extract_dir(), 'datasources.json')
-            with open(datasources_path, encoding='utf-8') as stream:
+            with _lp_open(datasources_path, encoding='utf-8') as stream:
                 datasources = json.load(stream)
             staged = stage_fabric_file_sources(project_dir, datasources)
             if staged:
@@ -6537,7 +6609,7 @@ def _process_twbx_post_generation(source_path, project_dir, source_basename):
     _DATA_EXT = {'.xlsx', '.xls', '.csv', '.tsv', '.json', '.xml', '.pdf',
                  '.geojson', '.topojson', '.parquet', '.hyper', '.tde'}
     data_parents = set()
-    for root, _dirs, files in os.walk(data_dir):
+    for root, _dirs, files in _lp_walk(data_dir):
         for fname in files:
             ext = os.path.splitext(fname)[1].lower()
             if ext in _DATA_EXT:
@@ -6563,9 +6635,9 @@ def _process_twbx_post_generation(source_path, project_dir, source_basename):
         'definition',
         'expressions.tmdl',
     )
-    if os.path.isfile(expr_path):
+    if _lp_isfile(expr_path):
         try:
-            with open(expr_path, 'r', encoding='utf-8') as f:
+            with _lp_open(expr_path, 'r', encoding='utf-8') as f:
                 expr_content = f.read()
             abs_data_dir = os.path.abspath(actual_data_dir).replace('\\', '\\\\')
             new_content = _re.sub(
@@ -6574,7 +6646,7 @@ def _process_twbx_post_generation(source_path, project_dir, source_basename):
                 expr_content,
             )
             if new_content != expr_content:
-                with open(expr_path, 'w', encoding='utf-8') as f:
+                with _lp_open(expr_path, 'w', encoding='utf-8') as f:
                     f.write(new_content)
                 print(f"  📂 DataFolder updated → {os.path.abspath(actual_data_dir)}")
         except OSError as exc:
@@ -6592,7 +6664,7 @@ def _process_twbx_post_generation(source_path, project_dir, source_basename):
     report_dir = os.path.join(project_dir, f'{source_basename}.Report', 'definition')
     for vj_path in _glob.glob(os.path.join(report_dir, 'pages', '*', 'visuals', '*', 'visual.json')):
         try:
-            with open(vj_path, 'r', encoding='utf-8') as f:
+            with _lp_open(vj_path, 'r', encoding='utf-8') as f:
                 vj = json.load(f)
             gen_props = (vj.get('visual', {}).get('objects', {}).get('general', [{}])[0]
                          .get('properties', {}))
@@ -6602,16 +6674,16 @@ def _process_twbx_post_generation(source_path, project_dir, source_basename):
             if not img_ref or img_ref.startswith(('http://', 'https://', 'data:')):
                 continue
             img_file = os.path.join(data_dir, img_ref)
-            if not os.path.isfile(img_file):
+            if not _lp_isfile(img_file):
                 img_file = os.path.join(project_dir, img_ref)
-            if os.path.isfile(img_file):
+            if _lp_isfile(img_file):
                 ext = os.path.splitext(img_ref)[1].lower()
                 mime = _MIME_MAP.get(ext, 'application/octet-stream')
-                with open(img_file, 'rb') as f:
+                with _lp_open(img_file, 'rb') as f:
                     b64 = _b64.b64encode(f.read()).decode('ascii')
                 data_uri = f'data:{mime};base64,{b64}'
                 gen_props['imageUrl'] = {"expr": {"Literal": {"Value": f"'{data_uri}'"}}}
-                with open(vj_path, 'w', encoding='utf-8') as f:
+                with _lp_open(vj_path, 'w', encoding='utf-8') as f:
                     json.dump(vj, f, indent=2, ensure_ascii=False)
         except (OSError, KeyError, IndexError, json.JSONDecodeError):
             continue
@@ -6668,7 +6740,7 @@ def _run_post_generation_reports(args, source_basename, results):
             # Save JSON report
             fidelity_path = os.path.join(out_base, f'fidelity_{source_basename}.json')
             import json as _json
-            with open(fidelity_path, 'w', encoding='utf-8') as _f:
+            with _lp_open(fidelity_path, 'w', encoding='utf-8') as _f:
                 _json.dump(fidelity, _f, indent=2, ensure_ascii=False)
             print(f"  Fidelity JSON: {fidelity_path}")
         except (ImportError, OSError, ValueError) as exc:
@@ -6690,7 +6762,7 @@ def _run_post_generation_reports(args, source_basename, results):
             # Save JSON report
             autoplay_path = os.path.join(out_base, f'autoplay_{source_basename}.json')
             import json as _json2
-            with open(autoplay_path, 'w', encoding='utf-8') as _f2:
+            with _lp_open(autoplay_path, 'w', encoding='utf-8') as _f2:
                 _json2.dump(autoplay_results, _f2, indent=2, ensure_ascii=False)
             print(f"  Autoplay JSON: {autoplay_path}")
         except (ImportError, OSError, ValueError) as exc:
@@ -6926,9 +6998,9 @@ def _run_schedule_migration(args, source_basename):
 
         # Write to project dir
         config_path = os.path.join(project_dir, 'refresh_config.json')
-        os.makedirs(project_dir, exist_ok=True)
+        _lp_makedirs(project_dir, exist_ok=True)
         import json as _json
-        with open(config_path, 'w', encoding='utf-8') as f:
+        with _lp_open(config_path, 'w', encoding='utf-8') as f:
             _json.dump(config, f, indent=2)
         print(f"  ✓ Refresh config: {config_path}")
 
@@ -7013,7 +7085,7 @@ def _run_single_migration(args):
     if args.rollback and not args.dry_run:
         out_base = args.output_dir or os.path.join('artifacts', 'powerbi_projects', 'migrated')
         existing_dir = os.path.join(out_base, source_basename)
-        if os.path.exists(existing_dir):
+        if _lp_exists(existing_dir):
             import shutil
             ts = datetime.now().strftime('%Y%m%d_%H%M%S')
             backup_dir = existing_dir + f'.backup_{ts}'
@@ -7077,8 +7149,8 @@ def _run_single_migration(args):
             out_base = args.output_dir or os.path.join('artifacts', 'powerbi_projects', 'migrated')
             meta_path = os.path.join(out_base, source_basename, 'migration_metadata.json')
             measures = []
-            if os.path.exists(meta_path):
-                with open(meta_path, 'r', encoding='utf-8') as f:
+            if _lp_exists(meta_path):
+                with _lp_open(meta_path, 'r', encoding='utf-8') as f:
                     meta = json.load(f)
                 measures = meta.get('measures', [])
             if measures:
@@ -7105,11 +7177,11 @@ def _run_single_migration(args):
             ds_path = os.path.join(json_dir, 'datasources.json')
             worksheets = []
             datasources = []
-            if os.path.exists(ws_path):
-                with open(ws_path, 'r', encoding='utf-8') as f:
+            if _lp_exists(ws_path):
+                with _lp_open(ws_path, 'r', encoding='utf-8') as f:
                     worksheets = json.load(f)
-            if os.path.exists(ds_path):
-                with open(ds_path, 'r', encoding='utf-8') as f:
+            if _lp_exists(ds_path):
+                with _lp_open(ds_path, 'r', encoding='utf-8') as f:
                     datasources = json.load(f)
             pag_stats = pag_gen.generate(
                 worksheets, datasources,
@@ -7206,7 +7278,7 @@ def _run_single_migration(args):
         try:
             from powerbi_import.sla_tracker import SLATracker
             sla_cfg_path = args.sla_config
-            with open(sla_cfg_path, 'r', encoding='utf-8') as f:
+            with _lp_open(sla_cfg_path, 'r', encoding='utf-8') as f:
                 sla_cfg = json.load(f)
             tracker = SLATracker(config=sla_cfg)
             elapsed = (datetime.now() - start_time).total_seconds()
